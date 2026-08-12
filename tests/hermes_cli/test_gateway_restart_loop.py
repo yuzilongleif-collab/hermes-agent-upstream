@@ -695,6 +695,40 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_python_heredoc_with_existing_path_objects_is_not_blocked(
+        self, tmp_path
+    ):
+        """A quoted Python heredoc may inspect real files and directories.
+
+        The shell-oriented reference walk must not promote a ``Path(...)``
+        data argument to an executed script. Before the fix, the existing
+        directory reached ``_read_referenced_script`` and failed closed even
+        though the command contained no gateway lifecycle action.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        package = tmp_path / "package"
+        package.mkdir()
+        module = package / "plugin.py"
+        module.write_text("PLUGIN_VERSION = '1.0.0'\n", encoding="utf-8")
+        command = (
+            "python3 - <<'PY'\n"
+            "from pathlib import Path\n"
+            f"module = Path({str(module)!r})\n"
+            f"root = Path({str(package)!r})\n"
+            "print(module.name, root.name)\n"
+            "PY\n"
+        )
+
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                command, cwd=str(tmp_path)
+            )
+            is False
+        )
+
     def test_nul_byte_in_path_token_does_not_crash_guard(self):
         """Residual #76762 class: when a NUL byte survives into the *path
         token itself* (tokenized binary-adjacent command text), ``os.open``
