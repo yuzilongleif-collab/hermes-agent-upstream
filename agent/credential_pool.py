@@ -87,6 +87,7 @@ _TERMINAL_AUTH_REASONS = frozenset({
     "invalid_grant",        # RFC 6749: refresh_token rejected during refresh
     "unauthorized_client",  # RFC 6749: client no longer authorized
     "refresh_token_reused", # Single-use refresh token consumed by another process
+    "codex_auth_missing_refresh_token", # Hermes-internal Codex re-auth requirement
 })
 
 # How long a DEAD manual credential is preserved before being pruned.
@@ -876,16 +877,19 @@ class CredentialPool:
     ) -> bool:
         """Detect upstream-permanent OAuth failures that won't recover on TTL.
 
-        Only fires for 401 responses whose error code/reason matches a known
-        terminal OAuth state (token_invalidated, token_revoked, invalid_grant,
-        etc.).  Distinguishes permanent failures from transient ones like
-        token_expired (refreshable) or generic 401 without a specific reason
-        (could be a server-side glitch worth retrying).
+        Recognizes a known terminal OAuth reason when the provider reports HTTP
+        401, or when the refresh adapter preserves the structured reason but
+        not the token endpoint's status code.  Distinguishes permanent failures
+        from transient ones like token_expired or a generic 401 without a
+        specific reason.
 
-        Returns False for non-401 status codes — 429 rate limits and 402
-        billing failures are transient by nature and should keep TTL semantics.
+        Returns False for explicit non-401 status codes — 429 rate limits and
+        402 billing failures are transient by nature and should keep TTL
+        semantics.  The no-status form is reserved for in-process refresh
+        adapters that preserve an exact structured reason; public response
+        paths must pass their real HTTP status.
         """
-        if status_code != 401:
+        if status_code not in (None, 401):
             return False
         reason = normalized_error.get("reason")
         if not isinstance(reason, str):
@@ -1081,6 +1085,59 @@ class CredentialPool:
                 return updated
         except Exception as exc:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
+        return entry
+
+    def _sync_codex_manual_entry_from_pool_store(
+        self, entry: PooledCredential
+    ) -> PooledCredential:
+        """Adopt an independent manual row rotated by another pool instance.
+
+        Called while the shared auth-store lock is held.  Exact row identity,
+        not singleton lineage, is the authority for independent manuals.
+        """
+        if (
+            self.provider != "openai-codex"
+            or entry.source != SOURCE_MANUAL_DEVICE_CODE
+            or _codex_entry_shares_singleton_lineage(entry)
+        ):
+            return entry
+        try:
+            persisted = next(
+                (
+                    payload
+                    for payload in read_credential_pool(self.provider)
+                    if isinstance(payload, dict) and payload.get("id") == entry.id
+                ),
+                None,
+            )
+            if not isinstance(persisted, dict):
+                return entry
+            stored = PooledCredential.from_dict(self.provider, persisted)
+            if stored.source != entry.source:
+                logger.warning(
+                    "Pool entry %s: refusing Codex token adoption across source "
+                    "types (%s -> %s)",
+                    entry.id,
+                    entry.source,
+                    stored.source,
+                )
+                return entry
+            if (
+                stored.access_token != entry.access_token
+                or stored.refresh_token != entry.refresh_token
+            ):
+                logger.debug(
+                    "Pool entry %s: adopting Codex tokens rotated by another "
+                    "pool instance",
+                    entry.id,
+                )
+                self._replace_entry(entry, stored)
+                return stored
+        except Exception as exc:
+            logger.debug(
+                "Failed to sync independent Codex entry from credential pool: %s",
+                exc,
+            )
         return entry
 
     def _sync_xai_oauth_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
@@ -1400,9 +1457,29 @@ class CredentialPool:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
-        if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
+        if entry.auth_type != AUTH_TYPE_OAUTH:
             if force:
                 self._mark_exhausted(entry, None)
+            return None
+        if not entry.refresh_token:
+            if force:
+                if self.provider == "openai-codex":
+                    updated = self._mark_exhausted(
+                        entry,
+                        None,
+                        {
+                            "reason": "codex_auth_missing_refresh_token",
+                            "message": "Codex OAuth credential has no refresh token",
+                        },
+                    )
+                    logger.warning(
+                        "Credential pool: Codex entry %s has no refresh token; "
+                        "marked %s and requires re-auth",
+                        entry.label,
+                        updated.last_status,
+                    )
+                else:
+                    self._mark_exhausted(entry, None)
             return None
 
         # Codex and xAI OAuth refresh tokens are single-use.  The
@@ -1415,20 +1492,28 @@ class CredentialPool:
         # the lock, the in-lock re-sync below picks up the rotated token the
         # winner persisted and skips the POST.
         if self.provider in ("openai-codex", "xai-oauth"):
-            sync_entry = (
-                self._sync_codex_entry_from_auth_store
-                if self.provider == "openai-codex"
-                else self._sync_xai_oauth_entry_from_pool_store
-            )
+            if self.provider == "openai-codex":
+                sync_entry = (
+                    self._sync_codex_entry_from_auth_store
+                    if _codex_entry_shares_singleton_lineage(entry)
+                    else self._sync_codex_manual_entry_from_pool_store
+                )
+            else:
+                sync_entry = self._sync_xai_oauth_entry_from_pool_store
             with _auth_store_lock(
                 timeout_seconds=self._single_use_refresh_lock_timeout()
             ):
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
                     if synced is not entry:
-                        entry = synced
-                        if not force and not self._entry_needs_refresh(entry):
-                            return entry
+                        # A fresh, usable pair means the winning process already
+                        # completed the refresh; never spend its single-use
+                        # refresh token again.  A refresh-token-only adoption
+                        # keeps the stale access token, so that case must still
+                        # exchange the new refresh token before returning.
+                        if not self._entry_needs_refresh(synced):
+                            return synced
+                        return self._refresh_entry_impl(synced, force=force)
                     return self._refresh_entry_impl(entry, force=force)
                 if (
                     synced.access_token != entry.access_token
@@ -1682,7 +1767,27 @@ class CredentialPool:
                 # store and drop singleton-seeded pool rows.
                 if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
                     if not _codex_entry_shares_singleton_lineage(entry):
-                        self._mark_exhausted(entry, None)
+                        # Exact invalid/reused/missing-token reasons become DEAD.
+                        # The lossy ``codex_refresh_failed`` fallback deliberately
+                        # stays EXHAUSTED so a bodyless 4xx cannot permanently
+                        # disable an otherwise recoverable manual credential.
+                        error_code = str(
+                            getattr(exc, "code", None)
+                            or "credential_pool_refresh_failure"
+                        )
+                        updated = self._mark_exhausted(
+                            entry,
+                            None,
+                            {"reason": error_code, "message": str(exc)[:500]},
+                        )
+                        logger.warning(
+                            "credential pool: independent Codex credential %s "
+                            "refresh failed (%s); marked %s without changing "
+                            "singleton state",
+                            entry.label or entry.id[:8],
+                            error_code,
+                            updated.last_status,
+                        )
                         return None
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"

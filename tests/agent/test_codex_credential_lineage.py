@@ -17,9 +17,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agent import credential_pool as CP
 from agent.credential_pool import (
     AUTH_TYPE_OAUTH,
+    STATUS_DEAD,
+    STATUS_EXHAUSTED,
     CredentialPool,
     PooledCredential,
 )
@@ -242,10 +246,251 @@ def test_independent_manual_refresh_uses_own_token_and_does_not_touch_singleton(
     assert by_id["seeded"]["refresh_token"] == "RA"
 
 
-def test_independent_manual_refresh_failure_does_not_quarantine_singleton(
+def test_singleton_force_refresh_skips_post_after_in_lock_resync(
     tmp_path, monkeypatch
 ):
-    """B (failure path). Independent refresh_token_reused must not wipe singleton."""
+    """force=True must not spend a singleton token another process rotated."""
+    home = _isolate_auth_home(tmp_path, monkeypatch)
+    _write_json(
+        home / "auth.json",
+        _auth_store(
+            singleton_access="A2",
+            singleton_refresh="RA2",
+            pool=[
+                _raw_pool_row(
+                    entry_id="seeded",
+                    source="device_code",
+                    access_token="A",
+                    refresh_token="RA",
+                )
+            ],
+        ),
+    )
+
+    def unexpected_refresh(*args, **kwargs):
+        raise AssertionError("in-lock singleton resync must skip a second POST")
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", unexpected_refresh)
+    stale = _pool_entry(
+        entry_id="seeded",
+        source="device_code",
+        access_token="A",
+        refresh_token="RA",
+    )
+    pool = CredentialPool(PROVIDER, [stale])
+
+    result = pool._refresh_entry(stale, force=True)
+
+    assert result is not None
+    assert result.access_token == "A2"
+    assert result.refresh_token == "RA2"
+
+
+def test_singleton_force_refresh_exchanges_new_refresh_token_when_access_stale(
+    tmp_path, monkeypatch
+):
+    """A refresh-token-only resync must still exchange the new token."""
+    home = _isolate_auth_home(tmp_path, monkeypatch)
+    expired_access = "e30.eyJleHAiOjF9.sig"
+    _write_json(
+        home / "auth.json",
+        _auth_store(
+            singleton_access=expired_access,
+            singleton_refresh="RA2",
+            pool=[
+                _raw_pool_row(
+                    entry_id="seeded",
+                    source="device_code",
+                    access_token=expired_access,
+                    refresh_token="RA",
+                )
+            ],
+        ),
+    )
+
+    presented: list[tuple[str, str]] = []
+
+    def fake_refresh(access_token, refresh_token, **kwargs):
+        presented.append((access_token, refresh_token))
+        return {
+            "access_token": "A3",
+            "refresh_token": "RA3",
+            "last_refresh": "2026-08-27T00:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
+    stale = _pool_entry(
+        entry_id="seeded",
+        source="device_code",
+        access_token=expired_access,
+        refresh_token="RA",
+    )
+    pool = CredentialPool(PROVIDER, [stale])
+
+    result = pool._refresh_entry(stale, force=True)
+
+    assert presented == [(expired_access, "RA2")]
+    assert result is not None
+    assert result.access_token == "A3"
+    assert result.refresh_token == "RA3"
+
+
+def test_independent_manual_force_refresh_adopts_rotated_pool_row(
+    tmp_path, monkeypatch
+):
+    """A lock waiter must not replay a single-use token the winner rotated."""
+    home = _isolate_auth_home(tmp_path, monkeypatch)
+    _write_json(
+        home / "auth.json",
+        _auth_store(
+            singleton_access="A",
+            singleton_refresh="RA",
+            pool=[
+                _raw_pool_row(
+                    entry_id="seeded",
+                    source="device_code",
+                    access_token="A",
+                    refresh_token="RA",
+                ),
+                _raw_pool_row(
+                    entry_id="manual-b",
+                    source="manual:device_code",
+                    access_token="B2",
+                    refresh_token="RB2",
+                ),
+            ],
+        ),
+    )
+
+    refresh_calls = []
+
+    def unexpected_refresh(*args, **kwargs):
+        refresh_calls.append((args, kwargs))
+        raise AssertionError("rotated pool row must skip a second refresh POST")
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", unexpected_refresh)
+    stale = _pool_entry(
+        entry_id="manual-b",
+        source="manual:device_code",
+        access_token="B",
+        refresh_token="RB",
+    )
+    seeded = _pool_entry(
+        entry_id="seeded",
+        source="device_code",
+        access_token="A",
+        refresh_token="RA",
+    )
+    pool = CredentialPool(PROVIDER, [seeded, stale])
+
+    result = pool._refresh_entry(stale, force=True)
+
+    assert result is not None
+    assert result.access_token == "B2"
+    assert result.refresh_token == "RB2"
+    assert refresh_calls == []
+    in_memory = next(item for item in pool.entries() if item.id == "manual-b")
+    assert in_memory.access_token == "B2"
+    assert in_memory.refresh_token == "RB2"
+    store = _read_json(home / "auth.json")
+    singleton = store["providers"][PROVIDER]["tokens"]
+    assert singleton == {"access_token": "A", "refresh_token": "RA"}
+
+
+def test_missing_codex_refresh_token_marks_dead_without_post(
+    tmp_path, monkeypatch
+):
+    """The real missing-refresh path must be terminal and diagnosable."""
+    home = _isolate_auth_home(tmp_path, monkeypatch)
+    _write_json(
+        home / "auth.json",
+        _auth_store(
+            singleton_access=None,
+            singleton_refresh=None,
+            include_provider=False,
+            pool=[
+                _raw_pool_row(
+                    entry_id="manual-b",
+                    source="manual:device_code",
+                    access_token="B",
+                    refresh_token="",
+                )
+            ],
+        ),
+    )
+
+    def unexpected_refresh(*args, **kwargs):
+        raise AssertionError("missing refresh token must not make a refresh POST")
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", unexpected_refresh)
+    manual = _pool_entry(
+        entry_id="manual-b",
+        source="manual:device_code",
+        access_token="B",
+        refresh_token="",
+    )
+    pool = CredentialPool(PROVIDER, [manual])
+
+    result = pool._refresh_entry(manual, force=True)
+
+    assert result is None
+    row = _read_json(home / "auth.json")["credential_pool"][PROVIDER][0]
+    assert row["last_status"] == STATUS_DEAD
+    assert row["last_error_reason"] == "codex_auth_missing_refresh_token"
+    in_memory = pool.entries()[0]
+    assert in_memory.last_status == STATUS_DEAD
+    assert in_memory.last_error_reason == "codex_auth_missing_refresh_token"
+
+
+def test_explicit_non_401_status_never_becomes_dead(tmp_path, monkeypatch):
+    """A terminal-looking reason cannot override a transient HTTP status."""
+    home = _isolate_auth_home(tmp_path, monkeypatch)
+    _write_json(
+        home / "auth.json",
+        _auth_store(
+            singleton_access=None,
+            singleton_refresh=None,
+            include_provider=False,
+            pool=[
+                _raw_pool_row(
+                    entry_id="manual-b",
+                    source="manual:device_code",
+                    access_token="B",
+                    refresh_token="RB",
+                )
+            ],
+        ),
+    )
+    manual = _pool_entry(
+        entry_id="manual-b",
+        source="manual:device_code",
+        access_token="B",
+        refresh_token="RB",
+    )
+    pool = CredentialPool(PROVIDER, [manual])
+
+    updated = pool._mark_exhausted(
+        manual,
+        429,
+        {"reason": "invalid_grant", "message": "transient rate limit"},
+    )
+
+    assert updated.last_status == STATUS_EXHAUSTED
+    assert updated.last_error_code == 429
+    assert updated.last_error_reason == "invalid_grant"
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_status", "expected_reason"),
+    [
+        ("refresh_token_reused", STATUS_DEAD, "refresh_token_reused"),
+        ("codex_refresh_failed", STATUS_EXHAUSTED, "codex_refresh_failed"),
+    ],
+)
+def test_independent_manual_refresh_failure_does_not_quarantine_singleton(
+    tmp_path, monkeypatch, caplog, error_code, expected_status, expected_reason
+):
+    """B (failure path). Independent refresh failure must not wipe singleton."""
     home = _isolate_auth_home(tmp_path, monkeypatch)
     _write_json(
         home / "auth.json",
@@ -274,9 +519,9 @@ def test_independent_manual_refresh_failure_does_not_quarantine_singleton(
     def boom(access_token, refresh_token, **kwargs):
         presented.append((access_token, refresh_token))
         raise AuthError(
-            "refresh_token_reused",
+            error_code,
             provider=PROVIDER,
-            code="refresh_token_reused",
+            code=error_code,
             relogin_required=True,
         )
 
@@ -309,6 +554,19 @@ def test_independent_manual_refresh_failure_does_not_quarantine_singleton(
     assert by_id["seeded"]["access_token"] == "A"
     assert by_id["seeded"]["refresh_token"] == "RA"
     assert "manual-b" in by_id
+    assert by_id["manual-b"]["last_status"] == expected_status
+    assert by_id["manual-b"]["last_error_code"] is None
+    assert by_id["manual-b"]["last_error_reason"] == expected_reason
+    assert by_id["manual-b"]["last_error_message"] == error_code
+    manual_after = next(item for item in pool.entries() if item.id == "manual-b")
+    assert manual_after.last_status == expected_status
+    assert manual_after.last_error_reason == expected_reason
+    assert any(
+        record.levelname == "WARNING"
+        and expected_reason in record.getMessage()
+        and expected_status in record.getMessage()
+        for record in caplog.records
+    )
     in_memory_ids = {item.id for item in pool.entries()}
     assert "seeded" in in_memory_ids
 
