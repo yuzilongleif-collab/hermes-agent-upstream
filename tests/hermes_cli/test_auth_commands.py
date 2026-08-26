@@ -1110,3 +1110,21 @@ def test_auth_remove_env_seeded_dotenv_with_bom_no_shell_hint(tmp_path, monkeypa
     out = capsys.readouterr().out
     assert "Cleared DEEPSEEK_API_KEY from .env" in out
     assert "still set in your shell environment" not in out
+
+
+def test_dead_credential_status_shows_exact_reauth_command():
+    from types import SimpleNamespace
+
+    from hermes_cli.auth_commands import _format_exhausted_status
+
+    entry = SimpleNamespace(
+        provider="openai-codex",
+        last_status="dead",
+        last_error_reason="refresh_token_reused",
+        last_error_code=None,
+    )
+
+    assert _format_exhausted_status(entry) == (
+        " dead refresh_token_reused "
+        "(re-auth required: hermes auth add openai-codex)"
+    )

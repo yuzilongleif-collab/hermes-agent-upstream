@@ -15,6 +15,7 @@ from agent.credential_pool import (
     CUSTOM_POOL_PREFIX,
     SOURCE_MANUAL,
     SOURCE_MANUAL_DEVICE_CODE,
+    STATUS_DEAD,
     STATUS_EXHAUSTED,
     STRATEGY_FILL_FIRST,
     STRATEGY_ROUND_ROBIN,
@@ -217,12 +218,16 @@ def _classify_exhausted_status(entry) -> tuple[str, bool]:
 
 
 def _format_exhausted_status(entry) -> str:
-    if entry.last_status != STATUS_EXHAUSTED:
-        return ""
-    label, show_retry_window = _classify_exhausted_status(entry)
     reason = getattr(entry, "last_error_reason", None)
     reason_text = f" {reason}" if isinstance(reason, str) and reason.strip() else ""
     code = f" ({entry.last_error_code})" if entry.last_error_code else ""
+    if entry.last_status == STATUS_DEAD:
+        provider = str(getattr(entry, "provider", "") or "").strip()
+        command = f"hermes auth add {provider}" if provider else "hermes auth add <provider>"
+        return f" dead{reason_text}{code} (re-auth required: {command})"
+    if entry.last_status != STATUS_EXHAUSTED:
+        return ""
+    label, show_retry_window = _classify_exhausted_status(entry)
     if not show_retry_window:
         return f" {label}{reason_text}{code} (re-auth may be required)"
     exhausted_until = _exhausted_until(entry)
