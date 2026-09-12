@@ -1171,7 +1171,7 @@ class CredentialPool(CredentialPoolAdminMixin):
         return entry
 
     def _sync_entry_from_pool_store(self, entry: PooledCredential) -> PooledCredential:
-        """Adopt a token pair rotated by another pool instance (anthropic, xai-oauth).
+        """Adopt a token pair rotated by another pool instance.
 
         Re-reads the exact persisted row from the credential-pool store while
         the shared cross-process auth-store lock is held. Direct integrations
@@ -1185,7 +1185,7 @@ class CredentialPool(CredentialPoolAdminMixin):
         the pool store, is token authority for those sources; a row with no
         token material at all is refused for the same reason.
         """
-        if self.provider not in ("anthropic", "xai-oauth"):
+        if self.provider not in ("anthropic", "xai-oauth", "openai-codex"):
             return entry
         is_anthropic = self.provider == "anthropic"
         if is_anthropic and is_borrowed_credential_source(entry.source, self.provider):
@@ -1198,19 +1198,29 @@ class CredentialPool(CredentialPoolAdminMixin):
             if not isinstance(persisted, dict):
                 return entry
             stored = PooledCredential.from_dict(self.provider, persisted)
-            if is_anthropic and not (stored.access_token or "").strip() and not (stored.refresh_token or "").strip():
+            if self.provider == "openai-codex" and stored.source != entry.source:
                 return entry
-            if stored.access_token != entry.access_token or stored.refresh_token != entry.refresh_token:
+            if (
+                self.provider in ("anthropic", "openai-codex")
+                and not (stored.access_token or "").strip()
+                and not (stored.refresh_token or "").strip()
+            ):
+                return entry
+            if (
+                stored.access_token != entry.access_token
+                or stored.refresh_token != entry.refresh_token
+                or (self.provider == "openai-codex" and stored != entry)
+            ):
                 logger.debug(
-                    "Pool entry %s: adopting %s OAuth tokens rotated by another pool instance",
-                    entry.id, "Anthropic" if is_anthropic else "xAI",
+                    "Pool entry %s: adopting %s OAuth state from another pool instance",
+                    entry.id, self.provider,
                 )
                 self._replace_entry(entry, stored)
                 return stored
         except Exception as exc:
             logger.debug(
                 "Failed to sync %s OAuth entry from credential pool: %s",
-                "Anthropic" if is_anthropic else "xAI", exc,
+                self.provider, exc,
             )
         return entry
 
@@ -1231,8 +1241,9 @@ class CredentialPool(CredentialPoolAdminMixin):
             return entry
         display = spec[0]
         is_codex = self.provider == "openai-codex"
-        sources = ("device_code", "manual:device_code") if is_codex else ("device_code",)
-        if entry.source not in sources:
+        # Manual entries own independent grants, even for the same account.
+        # Their authority is the exact pool row, never the default login.
+        if entry.source != "device_code":
             return entry
         try:
             with _auth_store_lock():
@@ -1398,6 +1409,20 @@ class CredentialPool(CredentialPoolAdminMixin):
         # the winner's rotated token and skips the POST.
         with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
             if self.provider == "openai-codex":
+                if entry.source != "device_code":
+                    synced = self._sync_entry_from_pool_store(entry)
+                    if synced.last_status == STATUS_DEAD:
+                        return None
+                    cooldown = _exhausted_until(synced)
+                    if cooldown is not None and cooldown > time.time():
+                        return None
+                    rotated = (
+                        synced.access_token != entry.access_token
+                        or synced.refresh_token != entry.refresh_token
+                    )
+                    if rotated and (synced.access_token or "").strip() and not self._entry_needs_refresh(synced):
+                        return synced
+                    return self._refresh_entry_impl(synced, force=force)
                 synced = self._sync_entry_from_auth_store(entry)
                 if synced is not entry and not force and not self._entry_needs_refresh(synced):
                     return synced
@@ -1654,6 +1679,32 @@ class CredentialPool(CredentialPoolAdminMixin):
                     return self._adopt(synced, **_MARK_OK)
         elif self.provider in _TOKENS_SINGLETON_PROVIDERS:
             _, display, _, terminal_fn_name = _TOKENS_SINGLETON_PROVIDERS[self.provider]
+            if self.provider == "openai-codex" and entry.source != "device_code":
+                synced = self._sync_entry_from_pool_store(entry)
+                cooldown = _exhausted_until(synced)
+                if synced.last_status == STATUS_DEAD or (cooldown is not None and cooldown > time.time()):
+                    return None
+                if synced.access_token != entry.access_token or synced.refresh_token != entry.refresh_token:
+                    # A failed POST of the old pair says nothing about the
+                    # peer's pair. Preserve it, but never return empty/expired
+                    # access tokens as successful refresh results.
+                    if (synced.access_token or "").strip() and not self._entry_needs_refresh(synced):
+                        return synced
+                    return None
+                entry = synced
+                if getattr(auth_mod, terminal_fn_name)(exc):
+                    # Keep a dead manual grant visible for reauthentication;
+                    # never quarantine or clear an unrelated singleton.
+                    self._adopt(
+                        entry,
+                        last_status=STATUS_DEAD,
+                        last_status_at=time.time(),
+                        last_error_code=401,
+                        last_error_reason=getattr(exc, "code", "invalid_grant"),
+                        last_error_message="OAuth grant is invalid; re-authenticate this credential.",
+                        last_error_reset_at=None,
+                    )
+                    return None
             synced = self._sync_entry_from_auth_store(entry)
             if synced.refresh_token != entry.refresh_token:
                 logger.debug("%s OAuth refresh failed but auth.json has newer tokens — adopting", display)

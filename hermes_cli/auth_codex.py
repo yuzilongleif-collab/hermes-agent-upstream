@@ -648,6 +648,10 @@ def _pool_codex_access_token() -> str:
     from hermes_cli.auth import _nonempty_str, read_credential_pool
     try:
         for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
+            # A dead grant has no reset timestamp; do not resurrect it through
+            # the singleton-empty runtime fallback.
+            if entry.get("last_status") == "dead":
+                continue
             token, reset_at = entry.get("access_token"), entry.get("last_error_reset_at")
             in_cooldown = isinstance(reset_at, (int, float)) and reset_at > time.time()
             if _nonempty_str(token) and not in_cooldown:
