@@ -1172,9 +1172,17 @@ class CredentialPool(CredentialPoolAdminMixin):
             stored = PooledCredential.from_dict(self.provider, persisted)
             if is_anthropic and not (stored.access_token or "").strip() and not (stored.refresh_token or "").strip():
                 return entry
-            if stored.access_token != entry.access_token or stored.refresh_token != entry.refresh_token:
+            token_changed = stored.access_token != entry.access_token or stored.refresh_token != entry.refresh_token
+            # Codex pool-only rows also own the latest quarantine/cooldown verdict.
+            # A peer can invalidate a row without rotating either token.
+            status_changed = self.provider == "openai-codex" and any(
+                getattr(stored, field) != getattr(entry, field)
+                for field in ("last_status", "last_status_at", "last_error_code",
+                              "last_error_reason", "last_error_message", "last_error_reset_at")
+            )
+            if token_changed or status_changed:
                 logger.debug(
-                    "Pool entry %s: adopting %s OAuth tokens rotated by another pool instance",
+                    "Pool entry %s: adopting %s OAuth row updated by another pool instance",
                     entry.id, display,
                 )
                 self._replace_entry(entry, stored)
@@ -1374,6 +1382,13 @@ class CredentialPool(CredentialPoolAdminMixin):
                 # Re-read this row before spending its single-use refresh token.
                 synced = self._sync_entry_from_pool_store(entry)
                 synced = self._sync_entry_from_auth_store(synced)
+                # Token freshness does not override a peer's terminal/cooldown verdict.
+                if synced.last_status == STATUS_DEAD:
+                    return None
+                if synced.last_status == STATUS_EXHAUSTED and (
+                    _exhausted_until(synced, sole_credential=self._is_sole_credential()) or 0
+                ) > time.time():
+                    return None
                 if (
                     synced.access_token != entry.access_token
                     or synced.refresh_token != entry.refresh_token
@@ -1752,7 +1767,9 @@ class CredentialPool(CredentialPoolAdminMixin):
                 return False
             return int(entry.expires_at_ms) <= int(time.time() * 1000) + 120_000
         if self.provider == "openai-codex":
-            return _codex_access_token_is_expiring(entry.access_token, CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS)
+            return not (entry.access_token or "").strip() or _codex_access_token_is_expiring(
+                entry.access_token, CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+            )
         if self.provider == "xai-oauth":
             return auth_mod._xai_access_token_is_expiring(
                 entry.access_token, auth_mod._xai_proactive_refresh_skew_seconds(entry.access_token),
