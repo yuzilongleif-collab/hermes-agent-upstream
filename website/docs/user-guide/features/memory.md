@@ -182,6 +182,31 @@ Memory has strict character limits to keep system prompts bounded:
 | memory | 2,200 chars | 8-15 entries |
 | user | 1,375 chars | 5-10 entries |
 
+The defaults above can be changed with `memory.memory_char_limit` and
+`memory.user_char_limit` in your profile's `config.yaml`. On versions containing
+this behavior, native built-in stores read the current integer limits before a
+`memory` tool call or approval replay, including calls on an agent that was already
+running when the limit was edited. This does not retrofit objects created before
+upgrading: those agents and processes keep their construction-time limits until
+rebuilt. Raising a limit does not require rebuilding a store created by the new
+factories. Lowering it never truncates existing entries; subsequent writes must
+satisfy the normal final-size and data-integrity checks.
+
+If an existing entry is longer than the new whole-store limit, the same running
+agent can still shorten or remove it. A store created later, for example after a
+restart, does not retain the previous object's quota history and treats such an
+entry as external drift and can refuse patch/remove. In that case, raise the limit
+again or edit the file manually.
+Shorten long entries before lowering the limit when they need to remain editable
+across a restart.
+
+Execution limits and the system-prompt snapshot are separate: the frozen memory
+block (including its old usage header) stays byte-stable until a normal snapshot
+refresh, such as a new conversation or compression. The refreshed header shows
+the limit last applied by a memory tool call or approval replay; a config edit
+alone does not update that header. Custom `MemoryStore` instances with explicit
+budgets do not opt into config refresh. External memory providers are unchanged.
+
 ### What Happens When Memory is Full
 
 When you try to add an entry that would exceed the limit, the tool returns an error:

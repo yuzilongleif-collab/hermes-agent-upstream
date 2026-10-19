@@ -54,11 +54,34 @@ def load_on_disk_store() -> MemoryStore:
         mem_cfg = get_builtin_memory_config(config)
         memory_enabled, user_profile_enabled = get_builtin_memory_store_flags(config)
         store = MemoryStore(int(mem_cfg.get("memory_char_limit", 2200)), int(mem_cfg.get("user_char_limit", 1375)),
-                            memory_enabled=memory_enabled, user_profile_enabled=user_profile_enabled)
+                            memory_enabled=memory_enabled, user_profile_enabled=user_profile_enabled,
+                            config_home=get_hermes_home())
     except Exception:
-        store = MemoryStore()  # config optional — fall back to defaults rather than break /memory
+        store = MemoryStore(config_home=get_hermes_home())  # config optional — fall back rather than break /memory
     store.load_from_disk()
     return store
+
+
+def _refresh_configured_limits(store: MemoryStore) -> None:
+    """Refresh execution budgets, never the frozen prompt or availability/provider state.
+
+    The caller must already be in the store's owning profile scope. Unbound/foreign
+    calls and explicit custom stores must not adopt the launch profile's config.
+    """
+    if store._config_home is None or store._config_home != get_hermes_home():
+        return
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = get_builtin_memory_config(load_config_readonly())
+    except Exception:
+        logger.debug("Could not refresh built-in memory limits", exc_info=True)
+        return
+    for target, key, default in (("memory", "memory_char_limit", 2200), ("user", "user_char_limit", 1375)):
+        value = config.get(key, default)
+        # Do not widen config coercion here; a malformed edit keeps the last usable cap.
+        if type(value) is int:
+            store._drift_char_limits[target] = max(store._drift_char_limits[target], value)
+            setattr(store, key, value)
 
 
 def _pin_matched_entries(store: MemoryStore, payload: dict[str, Any]) -> Optional[str]:
@@ -227,6 +250,7 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
     aliases ``content``."""
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+    _refresh_configured_limits(store)
     token = FAILURE_CLASS.set("other")
     try:
         outcome, result = _memory_tool(action, target, content, old_text, new_text, operations, store)
@@ -355,6 +379,7 @@ def apply_memory_pending(payload: dict[str, Any], store: MemoryStore) -> dict[st
     replace/remove applies to exactly its pinned ``matched_entry`` or is refused; a record
     staged before pinning has no verifiable target, so it is refused rather than replayed by
     old_text (which could hit a newer entry the approver never saw)."""
+    _refresh_configured_limits(store)
     action, target = payload.get("action"), payload.get("target")
     target_error = _memory_target_error(store, target, payload.get("operations"))
     if target_error is not None:

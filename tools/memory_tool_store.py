@@ -184,11 +184,15 @@ class MemoryStore:
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *,
-                 memory_enabled: bool = True, user_profile_enabled: bool = True):
+                 memory_enabled: bool = True, user_profile_enabled: bool = True,
+                 config_home: Optional[Path] = None):
         self.memory_entries: list[str] = []
         self.user_entries: list[str] = []
         self.memory_char_limit, self.user_char_limit = memory_char_limit, user_char_limit
         self.memory_enabled, self.user_profile_enabled = memory_enabled, user_profile_enabled
+        # Only native config-owned stores opt in; explicit/custom budgets stay fixed.
+        self._config_home = Path(config_home) if config_home is not None else None
+        self._drift_char_limits = {"memory": memory_char_limit, "user": user_char_limit}
         self._system_prompt_snapshot: dict[str, str] = {"memory": "", "user": ""}
         self._consolidation_failures = 0  # per turn; reset by reset_consolidation_failures()
 
@@ -684,12 +688,17 @@ class MemoryStore:
 
     def _detect_external_drift(self, target: str, raw: str) -> Optional[str]:
         """``.bak.<ts>`` snapshot path if *raw* shows external drift, else None. The one
-        signal is an entry over the whole-file limit: no tool-written entry can be, so it is
+        signal is an entry over the known valid whole-file budget: no tool-written entry can be, so it is
         free-form text appended without delimiters, and replacing that "entry" would discard
         it. Layout differences (blank lines around ``§``, empty entries, padding) are NOT
         drift: parsing only strips whitespace, so the flush loses nothing but whitespace, and
-        refusing there blocked every replace/remove on a hand-formatted file for good (#107270)."""
-        if max(map(len, self._parse_entries(raw)), default=0) <= self._char_limit(target):
+        refusing there blocked every replace/remove on a hand-formatted file for good (#107270).
+        Config-owned live stores retain the budget high-water mark: a later quota cut is not drift."""
+        limit = self._char_limit(target)
+        if self._config_home is not None:
+            # Lowering a live quota cannot turn previously legal entries into foreign drift.
+            limit = max(limit, self._drift_char_limits[target])
+        if max(map(len, self._parse_entries(raw)), default=0) <= limit:
             return None
         path = self._path_for(target)
         bak_path = path.with_suffix(path.suffix + f".bak.{int(time.time())}")

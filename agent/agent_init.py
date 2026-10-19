@@ -1335,7 +1335,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
-                    memory_enabled=agent._memory_enabled,
+                    memory_enabled=agent._memory_enabled, config_home=get_hermes_home(),
                     user_profile_enabled=agent._user_profile_enabled,
                 )
                 agent._memory_store.load_from_disk()
