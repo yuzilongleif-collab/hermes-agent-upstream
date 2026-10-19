@@ -1132,15 +1132,6 @@ def _scoped_key_env(name: str) -> str:
         return (os.getenv(name) or "").strip()
 
 
-def _attempt_stream_socket(stream: Any) -> Any:
-    """The raw socket under an SDK event stream (``stream.response`` is the ``httpx.Response``;
-    httpcore publishes its connection as the ``network_stream`` extension), or None."""
-    from agent.agent_runtime_helpers import _socket_from_stream
-    extensions = getattr(getattr(stream, "response", None), "extensions", None)
-    network_stream = extensions.get("network_stream") if isinstance(extensions, dict) else None
-    return _socket_from_stream(network_stream) if network_stream is not None else None
-
-
 def _close_quietly(target: Any, failure_note: Optional[str]) -> None:
     """Call ``target.close()`` if present; a failure is debug-logged under ``failure_note`` (silent when None)."""
     close = getattr(target, "close", None)
@@ -1240,17 +1231,23 @@ class _CodexStreamGuard:
     def close_attempt_stream(self, failure_note: str) -> None:
         """Wake only this attempt's stream, never the shared client. The owner thread closes it;
         any other thread only ``shutdown()``s its socket, since ``Stream.close()`` would release the FD
-        under the owner's ``SSL_read`` (#70773, #130115). Socketless streams are closed as before."""
+        under the owner's ``SSL_read`` (#70773, #130115). Failed discovery does not prove a stream
+        is socketless: leave cleanup to the owner and its bounded SDK read timeout (#134866)."""
         with self._attempt_stream_lock:
             stream = self._attempt_stream
         if stream is None:
             return
         if threading.get_ident() != self._owner_tid:
-            sock = _attempt_stream_socket(stream)
+            try:
+                from agent.auxiliary_stream_watchdog import _stream_socket
+                sock = _stream_socket(stream)
+            except Exception:
+                logger.debug("Codex auxiliary: attempt socket discovery failed", exc_info=True)
+                return
             if sock is not None:
                 from agent.agent_runtime_helpers import _shutdown_socket
                 _shutdown_socket(sock)
-                return
+            return
         _close_quietly(stream, failure_note)
 
     def record_progress(self) -> None:

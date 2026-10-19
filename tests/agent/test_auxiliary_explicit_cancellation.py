@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import socket
 import threading
 import time
 from types import SimpleNamespace
@@ -191,21 +192,42 @@ def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None
     stream.close()
 
 
-def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None:
-    """A cancelled Codex worker's delayed timer owns only its event stream."""
-    owner_started = threading.Event()
-
-    class _SilentOwnerStream:
-        def __init__(self) -> None:
+@pytest.fixture
+def silent_codex_stream():
+    """A real shutdown-wakeable transport, not an off-owner-close-only double."""
+    class SilentStream:
+        def __init__(self):
+            self.started = threading.Event()
             self.closed = threading.Event()
+            self.close_threads = []
+            self.reader, self.peer = socket.socketpair()
+            self.reader.settimeout(5)
+            self.response = SimpleNamespace(extensions={
+                "network_stream": SimpleNamespace(get_extra_info=lambda name: self.reader),
+            })
 
         def __iter__(self):
-            owner_started.set()
-            self.closed.wait(timeout=5)
-            raise RuntimeError("owner stream closed")
+            self.reader_tid = threading.get_ident()
+            self.started.set()
+            self.reader.recv(1)
+            raise RuntimeError("transport shut down")
 
-        def close(self) -> None:
+        def close(self):
+            self.close_threads.append(threading.get_ident())
+            self.reader.close()
             self.closed.set()
+
+    stream = SilentStream()
+    try:
+        yield stream
+    finally:
+        stream.peer.close()
+        stream.reader.close()
+
+
+def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client(silent_codex_stream) -> None:
+    """A cancelled Codex worker's delayed timer owns only its event stream."""
+    owner_started = silent_codex_stream.started
 
     class _SuccessStream:
         def __iter__(self):
@@ -228,7 +250,7 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
         def close(self) -> None:
             pass
 
-    owner_stream = _SilentOwnerStream()
+    owner_stream = silent_codex_stream
 
     class _SharedResponses:
         def __init__(self, real_client: Any) -> None:
@@ -292,9 +314,9 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
         )
         assert concurrent.choices[0].message.content == "ok"
 
-        # Let the orphan's real adapter timer fire. It may close the attempt's
-        # event stream to wake that worker, but never the process-shared client.
+        # The timer shuts down the attempt socket; only the reader closes it.
         assert owner_stream.closed.wait(timeout=1)
+        assert owner_stream.close_threads == [owner_stream.reader_tid]
         time.sleep(0.03)
         assert not real_client.closed.is_set()
         with aux._client_cache_lock:
@@ -313,13 +335,13 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
 
 @pytest.mark.parametrize("winner", ["timeout", "cancel"])
 def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
-    winner: str,
+    winner: str, silent_codex_stream,
 ) -> None:
     """Timeout and explicit cancel can never produce a mixed owner/cleanup result."""
     timer_read_started = threading.Event()
     allow_timer_read_return = threading.Event()
     request_cancelled = threading.Event()
-    stream_started = threading.Event()
+    stream_started = silent_codex_stream.started
 
     class _RacingCancelSource:
         def is_set(self) -> bool:
@@ -334,19 +356,7 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
                 return was_set
             return request_cancelled.is_set()
 
-    class _SilentStream:
-        def __init__(self) -> None:
-            self.closed = threading.Event()
-
-        def __iter__(self):
-            stream_started.set()
-            self.closed.wait(timeout=5)
-            raise RuntimeError("stream closed")
-
-        def close(self) -> None:
-            self.closed.set()
-
-    stream = _SilentStream()
+    stream = silent_codex_stream
 
     class _RealClient:
         def __init__(self) -> None:
@@ -393,6 +403,7 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
         assert isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
         assert stream.closed.wait(timeout=1), "cancelled timer did not wake its stream"
         assert not real_client.closed.is_set()
+    assert stream.close_threads and set(stream.close_threads) == {stream.reader_tid}
 
 
 def test_anthropic_silent_stream_is_isolated_without_closing_shared_client() -> None:
