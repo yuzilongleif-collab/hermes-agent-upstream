@@ -202,11 +202,13 @@ async def read(connection, ref, params, *, kind):
         raise RuntimeStoreError('not_found')
     authorize(connection, ref, params, 'session:read')
     live = authority.sessions[ref.session_id]
+    if kind == 'control':
+        # Freeze the only live input on the owner loop. This persisted-only projection reads
+        # no pending controls, settling admissions or stream sequence: holding the stream lock
+        # across get_meta's writer wait would also park loop-side readers (approval.pending).
+        return {'control': await asyncio.to_thread(
+            _control_snapshot, authority.db, ref.session_id, live.source.platform)}
     with live.event_stream.lock:
-        if kind == 'control':
-            # Persisted per session id, never the route's live objects: readable after a messaging
-            # route moved on to another conversation.
-            return {'control': control_snapshot(authority, ref)}
         _require_current_route(authority, ref)
         agent, records = _owner_objects(authority, ref, include_fallback_evicted=kind == 'subagents')
         if kind == 'subagents':
@@ -409,14 +411,23 @@ def _owner_objects(authority, ref, *, include_fallback_evicted=False):
 
 
 def physical_target(authority, ref):
+    return _physical_target(authority.db, ref.session_id, authority.sessions[ref.session_id].source.platform)
+
+
+def _physical_target(db, session_id, platform):
     from gateway.config import Platform
-    if authority.sessions[ref.session_id].source.platform == Platform.LOCAL:
+    if platform == Platform.LOCAL:
         from hermes_state_local import local_receipt
-        return local_receipt(authority.db, ref.session_id)['entry']['session_id']
-    return ref.session_id
+        return local_receipt(db, session_id)['entry']['session_id']
+    return session_id
 
 
 def control_snapshot(authority, ref):
+    return _control_snapshot(authority.db, ref.session_id, authority.sessions[ref.session_id].source.platform)
+
+
+def _control_snapshot(db, session_id, platform):
+    """Persisted per conversation, never its route's live objects or event-stream state."""
     from hermes_cli.goals import GoalState
     from hermes_cli.loops import LoopState
     from hermes_cli.heartbeat import HeartbeatState
@@ -427,11 +438,11 @@ def control_snapshot(authority, ref):
         _snapshot_revision, _snapshot_updated_at,
     )
     # Compression carries goal/loop/heartbeat to the continuation: read the current segment.
-    target = physical_target(authority, ref)
-    target = authority.db.get_compression_tip(target) or target
+    target = _physical_target(db, session_id, platform)
+    target = db.get_compression_tip(target) or target
     states = []
     for kind, cls in [('goal', GoalState), ('loop', LoopState), ('heartbeat', HeartbeatState)]:
-        raw = authority.db.get_meta(kind + ':' + target)
+        raw = db.get_meta(kind + ':' + target)
         try:
             states.append(cls.from_json(raw) if raw else None)
         except (ValueError, TypeError, AttributeError) as exc:
