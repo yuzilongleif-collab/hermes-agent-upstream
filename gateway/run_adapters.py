@@ -1255,7 +1255,7 @@ class GatewayAdapterLifecycleMixin:
         self, profile_name: str, profile_home: Path, claimed: dict[tuple, str]
     ) -> int:
         """Create+connect one profile's adapters under its runtime scope."""
-        from gateway.run import _platform_has_bot_credential, _profile_runtime_scope
+        from gateway.run import _platform_has_bot_credential, _profile_runtime_scope, _write_runtime_status_quiet
         profile_cfg = await self._load_secondary_profile_config(profile_name, profile_home)
         # Keep the served profile's config: host-wide passes (planned-restart notices) must reach
         # every served profile's home channels, and this is the only place it is loaded.
@@ -1267,12 +1267,18 @@ class GatewayAdapterLifecycleMixin:
         profile_map = self._profile_adapters.setdefault(profile_name, {})
         connected = 0
         for platform, platform_config in profile_cfg.platforms.items():
-            if not platform_config.enabled:
-                continue
             # Runtime re-scan of a served profile (config/.env changed): only platforms that are not
             # already live or queued for reconnect are built — never a second poller on the same bot.
             if platform in profile_map or platform in (
                     (getattr(self, "_profile_failed_platforms", None) or {}).get(profile_name) or {}):
+                continue
+            if not platform_config.enabled:
+                # Reconcile only existing inactive state, never register a channel or hide a live one.
+                _write_runtime_status_quiet(
+                    platform=f"{profile_name}:{platform.value}", platform_state="disabled",
+                    error_code=None, error_message=None, needs_attention=False, retrying_since=None,
+                    only_existing_platform=True,
+                )
                 continue
             # No credential in THIS profile's scope: an adapter would fan inbound across every such profile.
             with _profile_runtime_scope(profile_home, hydrate_secrets=False):

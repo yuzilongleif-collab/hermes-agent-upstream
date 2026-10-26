@@ -1092,12 +1092,12 @@ def _prepare_runtime_status_update(
     error_code: Any = _UNSET, error_message: Any = _UNSET, needs_attention: Any = _UNSET,
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
     parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
-    platform_metrics: Any = _UNSET,
+    platform_metrics: Any = _UNSET, only_existing_platform: bool = False,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None,
     load_existing: bool = True, reload_existing: bool = False,
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
-    """Merge one update into the process-wide canonical status snapshot."""
+    """Merge into the canonical snapshot; ``only_existing_platform`` never adds a platform."""
     global _runtime_status_state_path, _runtime_status_state
     path = _get_runtime_status_path()
     with _runtime_status_state_lock:
@@ -1134,7 +1134,7 @@ def _prepare_runtime_status_update(
             ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
             ("session_store", session_store, _coerce_session_store),
         ))
-        if platform is not _UNSET:
+        if platform is not _UNSET and (not only_existing_platform or platform in payload["platforms"]):
             platform_payload = copy.deepcopy(payload["platforms"].get(platform, {}))
             if not isinstance(platform_payload, dict):
                 platform_payload = {}
