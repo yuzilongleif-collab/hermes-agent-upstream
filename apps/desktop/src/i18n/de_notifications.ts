@@ -1,5 +1,8 @@
 // Notification settings copy used when the desktop locale loads.
 export const deNotifications = {
+  minimumDurationTitle: 'Keep ordinary toasts for at least 10 seconds',
+  minimumDurationDesc:
+    'For new information and success toasts from Hermes and plugins in this client. Extends explicit short timings from enqueue, not visible time. Longer, sticky, actionable, warning and error timings stay unchanged; manual close remains available. OS alerts are separate.',
   title: 'Benachrichtigungen',
   intro: 'OS-Benachrichtigungen (keine In-App-Toasts). Pro Gerät.',
   enableAll: 'Benachrichtigungen aktivieren',

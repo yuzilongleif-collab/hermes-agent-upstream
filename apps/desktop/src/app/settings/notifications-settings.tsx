@@ -17,6 +17,7 @@ import {
   setNativeNotifyEnabled,
   setNativeNotifyKind
 } from '@/store/native-notifications'
+import { $notificationMinimumDuration, setNotificationMinimumDuration } from '@/store/notification-duration'
 import { notify } from '@/store/notifications'
 
 import { CONTROL_TEXT } from './constants'
@@ -37,6 +38,7 @@ interface NotificationsSettingsProps {
 export function NotificationsSettings({ subpage }: NotificationsSettingsProps = {}) {
   const { t } = useI18n()
   const prefs = useStore($nativeNotifyPrefs)
+  const minimumDuration = useStore($notificationMinimumDuration)
   const muted = useStore($hapticsMuted)
   const completionSoundVariantId = useStore($completionSoundVariantId)
   const copy = t.settings.notifications
@@ -56,6 +58,13 @@ export function NotificationsSettings({ subpage }: NotificationsSettingsProps = 
       {showAlerts && (
         <>
           {subpage === undefined && <SectionHeading icon={Bell} title={copy.title} />}
+          <ToggleRow
+            checked={minimumDuration === 10_000}
+            description={copy.minimumDurationDesc}
+            id={settingElementId(SETTING_IDS.notifications.minimumDuration)}
+            label={copy.minimumDurationTitle}
+            onChange={enabled => setNotificationMinimumDuration(enabled ? 10_000 : 0)}
+          />
           <Caption className="mb-2 leading-(--conversation-caption-line-height)">{copy.intro}</Caption>
 
           <ToggleRow

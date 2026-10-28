@@ -1,5 +1,8 @@
 // Notification settings copy used when the desktop locale loads.
 export const zhNotifications = {
+  minimumDurationTitle: '普通通知至少停留10秒',
+  minimumDurationDesc:
+    '延长本客户端新普通信息、成功通知（含插件及显式短时长）的自动关闭等待，从入队计时，不保证可见10秒。更长时长、常驻、带操作、警告及错误保持原计时，仍可手动关闭；与系统通知分开。',
   title: '通知',
   intro: '原生桌面通知，区别于应用内提示。设置按设备保存，每台电脑各自独立。',
   enableAll: '启用通知',

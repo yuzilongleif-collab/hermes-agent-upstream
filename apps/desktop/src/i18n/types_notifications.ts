@@ -1,5 +1,7 @@
 // Notification settings types used by every desktop locale.
 export interface NotificationSettingsTranslations {
+  minimumDurationTitle: string
+  minimumDurationDesc: string
   title: string
   intro: string
   enableAll: string

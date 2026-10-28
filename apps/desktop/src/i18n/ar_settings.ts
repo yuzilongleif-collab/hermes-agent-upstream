@@ -229,6 +229,9 @@ export const arSettings = {
       }
     },
     notifications: {
+      minimumDurationTitle: 'Keep ordinary toasts for at least 10 seconds',
+      minimumDurationDesc:
+        'For new information and success toasts from Hermes and plugins in this client. Extends explicit short timings from enqueue, not visible time. Longer, sticky, actionable, warning and error timings stay unchanged; manual close remains available. OS alerts are separate.',
       title: 'الإشعارات',
       intro:
         'إشعارات سطح المكتب الأصلية، منفصلة عن التنبيهات داخل التطبيق. هذه محلية على الجهاز — كل حاسوب يحتفظ بإعداداته الخاصة.',

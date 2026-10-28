@@ -191,6 +191,14 @@ export const SETTINGS_MANIFEST = {
     }
   },
   notifications: {
+    minimumDuration: {
+      subpage: 'alerts',
+      keywords: ['toast', 'duration', 'reading', 'in-app', '10 seconds'],
+      copy: t => ({
+        label: t.settings.notifications.minimumDurationTitle,
+        description: t.settings.notifications.minimumDurationDesc
+      })
+    },
     enableAll: {
       subpage: 'alerts',
       keywords: ['notifications', 'alerts', 'native', 'banner', 'mute', 'do not disturb'],

@@ -201,6 +201,9 @@ export const zhHantSettings = {
       }
     },
     notifications: {
+      minimumDurationTitle: '一般通知至少停留10秒',
+      minimumDurationDesc:
+        '延長本客戶端新一般資訊、成功通知（含外掛及明確短時長）的自動關閉等待，從入列計時，不保證可見10秒。更長時長、常駐、帶操作、警告及錯誤保持原計時，仍可手動關閉；與系統通知分開。',
       title: '通知',
       intro: '原生桌面通知，與應用程式內提示不同。設定會依裝置保存，每台電腦各自獨立。',
       enableAll: '啟用通知',

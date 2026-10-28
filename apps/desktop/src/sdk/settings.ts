@@ -4,11 +4,19 @@ import { $backdrop, setBackdrop } from '@/store/backdrop'
 import { $chatTextScale, CHAT_TEXT_SCALE_PRESETS, type ChatTextScale, setChatTextScale } from '@/store/chat-text-scale'
 import { $composerPopoutGesturesEnabled, setComposerPopoutGesturesEnabled } from '@/store/composer-popout'
 import { $introSplash, setIntroSplash } from '@/store/intro-splash'
+import {
+  $notificationMinimumDuration,
+  isNotificationMinimumDuration,
+  type NotificationMinimumDuration,
+  setNotificationMinimumDuration
+} from '@/store/notification-duration'
 import { $reasoningCollapsedByDefault, setReasoningCollapsedByDefault } from '@/store/reasoning-disclosure'
 import { $sessionListDensity, type SessionListDensity, setSessionListDensity } from '@/store/session-list-density'
 import { $tabStripDefault, setTabStripDefault, type TabStripDefault } from '@/store/tabstrip-prefs'
 
 export interface DesktopSettingValues {
+  /** Opt-in minimum for ordinary info/success toasts; 0 retains caller timing. */
+  'notifications.minimumDurationMs': NotificationMinimumDuration
   'backdrop.v1': boolean
   chatTextScale: ChatTextScale
   'composerPopout.gesturesEnabled': boolean
@@ -52,6 +60,11 @@ const isTabStripDefault = (value: unknown): value is TabStripDefault =>
   value === 'auto' || value === 'always' || value === 'never'
 
 const settingBindings = {
+  'notifications.minimumDurationMs': bindSetting(
+    $notificationMinimumDuration,
+    setNotificationMinimumDuration,
+    isNotificationMinimumDuration
+  ),
   'backdrop.v1': bindSetting($backdrop, setBackdrop, isBoolean),
   chatTextScale: bindSetting($chatTextScale, setChatTextScale, isChatTextScale),
   'composerPopout.gesturesEnabled': bindSetting(

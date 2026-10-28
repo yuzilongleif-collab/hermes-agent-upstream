@@ -4,6 +4,7 @@ import { translateNow } from '@/i18n'
 import { isOutOfSyncRpcParams } from '@/lib/gateway-rpc'
 import { isTimeoutError } from '@/lib/with-timeout'
 import { type ErrorToastCategory, recordFriction } from '@/store/desktop-metrics'
+import { $notificationMinimumDuration } from '@/store/notification-duration'
 import { requestBackendRestart, requestRoute } from '@/store/recovery-requests'
 
 export type NotificationKind = 'error' | 'warning' | 'info' | 'success'
@@ -338,7 +339,18 @@ function showNotification(input: NotificationInput, errorCategory: ErrorToastCat
   // Visual depth is capped by CardStack, not by discarding queued notifications.
   $notifications.set([notification, ...$notifications.get().filter(item => item.id !== id)])
 
-  const duration = input.durationMs ?? defaultDuration(kind)
+  const requestedDuration = input.durationMs ?? defaultDuration(kind)
+
+  // One policy for core and SDK callers. Opt-in deliberately extends short
+  // explicit values, but never shortens longer values or makes sticky items expire.
+  // Action, severity and persistent contracts retain their existing timing.
+  const ordinary =
+    (kind === 'info' || kind === 'success') && !input.action && !input.secondaryAction && !input.persistent
+
+  const duration =
+    ordinary && Number.isFinite(requestedDuration) && requestedDuration > 0
+      ? Math.max(requestedDuration, $notificationMinimumDuration.get())
+      : requestedDuration
 
   if (duration > 0) {
     timers.set(

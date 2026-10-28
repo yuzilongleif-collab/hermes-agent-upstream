@@ -1,5 +1,8 @@
 // Notification settings copy used when the desktop locale loads.
 export const jaNotifications = {
+  minimumDurationTitle: 'Keep ordinary toasts for at least 10 seconds',
+  minimumDurationDesc:
+    'For new information and success toasts from Hermes and plugins in this client. Extends explicit short timings from enqueue, not visible time. Longer, sticky, actionable, warning and error timings stay unchanged; manual close remains available. OS alerts are separate.',
   title: '通知',
   intro: 'アプリ内トーストとは別の、ネイティブのデスクトップ通知です。設定は端末ごとに保存されます。',
   enableAll: '通知を有効にする',

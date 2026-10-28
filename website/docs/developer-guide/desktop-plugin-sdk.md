@@ -1879,6 +1879,7 @@ type DesktopSettingValues = {
   'reasoning.collapsedByDefault': boolean
   sessionListDensity: 'compact' | 'comfortable' | 'detailed'
   tabStripDefault: 'auto' | 'always' | 'never'
+  'notifications.minimumDurationMs': 0 | 10000
 }
 host.settings.get<K extends DesktopSettingKey>(key: K): DesktopSettingValues[K]
 host.settings.set<K extends DesktopSettingKey>(key: K, value: DesktopSettingValues[K]): void
@@ -1896,6 +1897,20 @@ register(ctx) {
   ctx.onDispose(dispose)
 }
 ```
+
+`notifications.minimumDurationMs` is an opt-in automatic-close minimum for ordinary
+info/success toasts, shared by core callers and `host.notify`. Default `0` keeps
+caller timing; `10000` extends finite positive timings shorter than ten seconds,
+including explicit `durationMs: 1500`. Longer timings and `durationMs: 0` are
+unchanged. Warning/error, action/secondary-action and `persistent` inputs keep
+their original explicit/default timing; `persistent` is not a never-expire flag.
+The clock starts at enqueue, not first visibility. Replacement, clear and manual
+or programmatic dismissal still work immediately. Changes apply only to new
+notifications. This preference is local to the current client's storage
+origin/partition (including its same-origin windows), not every installation or
+Web endpoint on a machine; OS notification preferences are separate. Plugins
+must change it only for an explicit user choice, never at registration or reset
+it on unload. `host.notify` keeps the same input shape and return ID.
 
 `chatTextScale` is the user's chat text size (default `110`). It scales the
 transcript and composer text (and its line height) through the host's

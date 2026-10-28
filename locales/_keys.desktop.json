@@ -3984,6 +3984,8 @@
     "settings.notifications.kinds.turnDone.label",
     "settings.notifications.kinds.turnError.description",
     "settings.notifications.kinds.turnError.label",
+    "settings.notifications.minimumDurationDesc",
+    "settings.notifications.minimumDurationTitle",
     "settings.notifications.muteSoundsDesc",
     "settings.notifications.muteSoundsTitle",
     "settings.notifications.test",
