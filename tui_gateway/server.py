@@ -1749,57 +1749,6 @@ class _RuntimeFallbackResolution(NamedTuple):
 
 
 
-def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | None) -> None:
-    """Adopt the stored row's cwd and fill missing Git metadata, or persist a fresh cwd."""
-    owns_db, db = False, session_db
-    if db is None and not profile_home:
-        db = _get_db()
-    elif db is None:
-        try:
-            db = _open_profile_session_db(profile_home)
-            owns_db = True
-        except Exception:
-            # FAIL CLOSED (as the deferred-build bind): a named-profile session must never touch the launch
-            # state.db — skip hydration (the row lands on the agent's own lazy-create once the store recovers).
-            logger.warning("profile session store unavailable for %s — skipping cwd hydration instead of "
-                           "touching the launch state.db", profile_home, exc_info=True)
-    try:
-        if db is not None:
-            row = db.get_session(key) if hasattr(db, "get_session") else None
-            if row and _resumable_stored_cwd(row.get("cwd"), profile_home):
-                # An ssh or sandbox session's stored cwd is its workspace: explicit, so the remote terminal uses it
-                # instead of the backend default (an unpicked launch dir is never persisted for them). Host backends
-                # keep main's semantics (resolved outside the sessions lock: I/O).
-                remote = not _host_cwd_is_terminal_cwd(profile_home)
-                with _sessions_lock:
-                    if sid in _sessions:
-                        _sessions[sid]["cwd"] = row["cwd"]
-                        if remote:
-                            _sessions[sid]["explicit_cwd"] = True
-                # Lazy desktop rows already carry their explicitly chosen cwd, so they never reach the fresh-cwd
-                # branch below. Claim a generation before probing to keep an older probe from overwriting a later
-                # workspace move; complete rows do not need another probe on every resume.
-                if (not row.get("git_branch") or not row.get("git_repo_root")) and hasattr(
-                    db, "update_session_cwd"
-                ):
-                    try:
-                        _persist_session_cwd_and_schedule_git_meta(_sessions[sid], row["cwd"], db=db)
-                    except Exception:
-                        logger.debug("failed to enrich resumed session git metadata", exc_info=True)
-            elif (not (row and row.get("cwd")) or _is_other_profiles_cwd(row["cwd"], profile_home)) and hasattr(
-                db, "update_session_cwd"
-            ) and not _is_remote_launch_cwd(_sessions.get(sid)):
-                # A stored cwd that was set aside (Hermes's own host tree) stays as stored: only an empty row is filled,
-                # or a named profile's row holding another profile's dir (#87584), repaired to this session's own.
-                try:
-                    _persist_session_cwd_and_schedule_git_meta(_sessions[sid], _sessions[sid]["cwd"], db=db)
-                except Exception:
-                    logger.debug("failed to persist resumed session cwd", exc_info=True)
-    finally:
-        if owns_db and db is not None:
-            with contextlib.suppress(Exception):
-                db.close()
-
 
 
 

@@ -230,7 +230,19 @@ _LAUNCH_CWD_NOT_A_WORKSPACE = {"desktop"}
 
 def _context_cwd_is_launch_artifact(session: dict | None) -> bool:
     """Whether the session cwd came from app launch rather than user intent."""
-    return bool(session and not session.get("explicit_cwd") and _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE)
+    return bool(session and not session.get("explicit_cwd") and (
+        session.get("workspace_unbound") or _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE))
+
+
+def _restore_session_workspace_provenance(session: dict, row: dict | None) -> dict:
+    """A durable Home stays unbound even when a different transport resumes it.
+
+    Do not change runtime source: it also owns agent identity and prompt/tool policy.
+    An explicit workspace move wins over a later hydration of the old Home row.
+    """
+    if row and not row.get("cwd") and not session.get("explicit_cwd"):
+        session.update(workspace_unbound=True, explicit_cwd=False)
+    return session
 
 
 def _resolve_create_cwd(params: dict, source: str, profile_home) -> tuple[bool, str, bool]:
@@ -266,7 +278,7 @@ def _persisted_session_cwd(session: dict) -> str | None:
     """The cwd to stamp on the session's DB row, or None to leave it unset (launch-dir rule: ``_ensure_session_db_row``)."""
     if session.get("explicit_cwd"):
         return _session_cwd(session)
-    if _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE or _is_remote_launch_cwd(session):
+    if _context_cwd_is_launch_artifact(session) or _is_remote_launch_cwd(session):
         return None
     return str(session.get("cwd") or "") or None  # the session's OWN dir, never _session_cwd's gateway-wide fallback
 
@@ -433,7 +445,8 @@ def _display_session_cwd(session: dict | None) -> str:
     healed = _heal_dead_cwd(cwd)
     if healed and healed != cwd and session is not None:
         session["cwd"] = healed
-        _persist_session_cwd_and_schedule_git_meta(session, healed)
+        if _persisted_session_cwd(session):
+            _persist_session_cwd_and_schedule_git_meta(session, healed)
     return healed
 
 
@@ -954,6 +967,53 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
         from tools.terminal_tool_lifecycle import cleanup_vm
         cleanup_vm(session["session_key"])
     return resolved
+
+
+def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | None) -> None:
+    """Adopt a stored workspace and enrich Git metadata without promoting an execution fallback."""
+    owns_db, db = False, session_db
+    if db is None and not profile_home:
+        db = _get_db()
+    elif db is None:
+        try:
+            db = _open_profile_session_db(profile_home)
+            owns_db = True
+        except Exception:
+            # A named-profile failure must not fall back to the launch state.db.
+            logger.warning("profile session store unavailable for %s — skipping cwd hydration instead of "
+                           "touching the launch state.db", profile_home, exc_info=True)
+    try:
+        if db is not None:
+            row = db.get_session(key) if hasattr(db, "get_session") else None
+            if (session := _sessions.get(sid)) is not None:
+                _restore_session_workspace_provenance(session, row)
+            if row and _resumable_stored_cwd(row.get("cwd"), profile_home):
+                remote = not _host_cwd_is_terminal_cwd(profile_home)
+                with _sessions_lock:
+                    if sid in _sessions:
+                        _sessions[sid]["cwd"] = row["cwd"]
+                        if remote:
+                            _sessions[sid]["explicit_cwd"] = True
+                # Claim a generation before probing; an older probe must not overwrite a later move.
+                if (not row.get("git_branch") or not row.get("git_repo_root")) and hasattr(
+                    db, "update_session_cwd"
+                ):
+                    try:
+                        _persist_session_cwd_and_schedule_git_meta(_sessions[sid], row["cwd"], db=db)
+                    except Exception:
+                        logger.debug("failed to enrich resumed session git metadata", exc_info=True)
+            elif (not (row and row.get("cwd")) or _is_other_profiles_cwd(row["cwd"], profile_home)) and hasattr(
+                db, "update_session_cwd"
+            ) and (workspace := _persisted_session_cwd(_sessions.get(sid) or {})):
+                # Repair nonempty cross-profile launch artifacts, not an authoritative Home.
+                try:
+                    _persist_session_cwd_and_schedule_git_meta(_sessions[sid], workspace, db=db)
+                except Exception:
+                    logger.debug("failed to persist resumed session cwd", exc_info=True)
+    finally:
+        if owns_db and db is not None:
+            with contextlib.suppress(Exception):
+                db.close()
 
 
 def register(server) -> None:

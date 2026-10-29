@@ -81,16 +81,20 @@ def test_resume_lands_in_the_profiles_own_home(resume, profile, stored):
     live = resume(path)
 
     assert live["cwd"] == str(profile)
-    assert live["explicit_cwd"] is True
+    # A Desktop Home uses the profile directory for execution, not as an
+    # implicitly selected workspace. Stale nonempty rows still get repaired.
+    assert live["explicit_cwd"] is (stored is not None)
     assert server._terminal_task_cwd(live) == str(profile)
 
     # The agent build's hydration repairs the row, so the sidebar and later resumes agree with the live session.
     sid = next(s for s, rec in server._sessions.items() if rec is live)
     server._hydrate_session_cwd(sid, KEY, resume.db, str(profile))
-    assert resume.db.get_session(KEY)["cwd"] == str(profile)
+    assert resume.db.get_session(KEY)["cwd"] == (str(profile) if stored is not None else None)
 
 
-def test_resume_keeps_a_folder_chosen_for_the_profile(resume, profile, tmp_path):
+def test_resume_keeps_a_folder_chosen_for_the_profile(resume, profile, tmp_path, monkeypatch):
+    # Model an installation distinct from the workspace even when --basetemp is inside this checkout.
+    monkeypatch.setattr("agent.runtime_cwd._PACKAGE_ROOT", tmp_path / "installed-hermes")
     inside = profile / "workspace"
     inside.mkdir()
     outside = tmp_path / "proj"

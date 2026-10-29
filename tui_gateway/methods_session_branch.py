@@ -39,7 +39,8 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
                                            auth_user_id=parent_user_id)
             _init_session(new_sid, new_key, agent, list(history), cols=session.get("cols", 80),
                           cwd=_session_cwd(session), session_db=branch_db, source=source, profile_home=parent_home,
-                          explicit_cwd=bool(session.get("explicit_cwd")))
+                          explicit_cwd=bool(session.get("explicit_cwd")),
+                          workspace_unbound=bool(session.get("workspace_unbound")))
             _transfer_db_to_agent(agent, branch_db)
             branch_owns_db = False
         if new_sid in _sessions:
@@ -112,7 +113,7 @@ def _branch_live(rid, params: dict, session: dict, *, omit_messages: bool = Fals
             title = params.get("name", "") or _branch_title(db, old_key)
             home = session.get("profile_home")
             _persist_branch(db, new_key, old_key, title, history, source=source,
-                            cwd=None if _is_remote_launch_cwd(session) else _session_cwd(session),
+                            cwd=_persisted_session_cwd(session),
                             profile_name=profile_name_for_home(home) or _current_profile_name(),
                             model=_session_default_route(session)[0], copy_fields=_BRANCH_COPY_FIELDS,
                             title_source="user" if params.get("name") else "derived",

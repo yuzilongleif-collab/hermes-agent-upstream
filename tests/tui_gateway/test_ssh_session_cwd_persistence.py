@@ -102,11 +102,13 @@ def test_host_backends_still_persist_the_launch_dir(backend, tmp_path, name):
     assert server._persisted_session_cwd({"source": "tui", "cwd": str(tmp_path)}) == str(tmp_path)
 
 
-def test_hermes_owned_cwd(tmp_path):
+def test_hermes_owned_cwd(tmp_path, monkeypatch):
+    install = tmp_path / "installed-hermes"
+    monkeypatch.setattr("agent.runtime_cwd._PACKAGE_ROOT", install)
     home = server.get_hermes_home()
     assert server._is_hermes_owned_cwd(str(home), None)
     assert server._is_hermes_owned_cwd(_hermes_home_subdir("home"), None)
-    assert server._is_hermes_owned_cwd(str(server.Path(server.__file__).resolve().parent.parent), None)
+    assert server._is_hermes_owned_cwd(str(install), None)
     assert not server._is_hermes_owned_cwd("/home/me/proj", None)
     assert not server._is_hermes_owned_cwd(str(tmp_path), None)
 
@@ -189,7 +191,7 @@ def test_resume_without_a_stored_cwd_does_not_persist_the_launch_dir(backend, db
 
 @pytest.mark.parametrize("name", ["local", "docker"])
 def test_host_backends_resume_unchanged(backend, db, tmp_path, name):
-    """Docker installs on the local or docker backend keep adopting a stored cwd under HERMES_HOME."""
+    """Host backends adopt stored workspaces, but an existing NULL is not a new launch-cwd selection."""
     backend(name)
     stored = _hermes_home_subdir("home")
     db.create_session("host", source="tui", model="m", cwd=stored)
@@ -200,7 +202,7 @@ def test_host_backends_resume_unchanged(backend, db, tmp_path, name):
 
     db.create_session("host-fresh", source="tui", model="m")
     _hydrate(db, "host-fresh", {"session_key": "host-fresh", "source": "tui", "cwd": str(tmp_path)})
-    assert db.get_session("host-fresh")["cwd"] == str(tmp_path)
+    assert db.get_session("host-fresh")["cwd"] is None
 
 
 @pytest.mark.parametrize(("explicit", "expected"), [(False, None), (True, "/home/me/proj")])

@@ -64,6 +64,7 @@ def _compute_host_turn_frame(
         "cwd": _session_cwd(session),
         # Workspace provenance rides with the cwd: a sandbox backend registers an unpicked host cwd as nothing.
         "explicit_cwd": bool(session.get("explicit_cwd")),
+        "workspace_unbound": bool(session.get("workspace_unbound")),
         "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(session),
         "profile_home": session.get("profile_home") or "",
         "model_override": session.get("model_override"),

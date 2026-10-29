@@ -20,6 +20,8 @@ from tui_gateway import server
 @pytest.fixture
 def launch_dir(tmp_path, monkeypatch):
     """The gateway's launch directory: an existing host dir nobody picked, with no configured terminal.cwd."""
+    # Workspaces and installation are distinct, including when tmp_path is inside the source checkout.
+    monkeypatch.setattr("agent.runtime_cwd._PACKAGE_ROOT", tmp_path / "installed-hermes")
     home = tmp_path / "hermes-home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))

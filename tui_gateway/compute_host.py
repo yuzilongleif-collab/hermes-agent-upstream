@@ -331,6 +331,8 @@ class ComputeHost:
                     session[key] = str(frame[key])
             if "explicit_cwd" in frame:
                 session["explicit_cwd"] = bool(frame["explicit_cwd"])
+            if "workspace_unbound" in frame:
+                session["workspace_unbound"] = bool(frame["workspace_unbound"])
         else:
             session = self._build_server_session(server, frame, sid)
         if isinstance(frame.get("attached_images"), list):
@@ -397,7 +399,8 @@ class ComputeHost:
                 server._init_session(
                     sid, key, agent, list(history), cols=int(frame.get("cols") or 80),
                     cwd=str(frame.get("cwd") or "") or None, session_db=session_db,
-                    source=frame.get("source"), explicit_cwd=bool(frame.get("explicit_cwd")))
+                    source=frame.get("source"), explicit_cwd=bool(frame.get("explicit_cwd")),
+                    workspace_unbound=bool(frame.get("workspace_unbound")))
             finally:
                 reset_transport(token)
         except Exception:
@@ -411,6 +414,7 @@ class ComputeHost:
                 "attached_images": [], "image_counter": 0,
                 "cwd": str(frame.get("cwd") or os.getcwd()), "cols": int(frame.get("cols") or 80),
                 "explicit_cwd": bool(frame.get("explicit_cwd")),
+                "workspace_unbound": bool(frame.get("workspace_unbound")),
                 "slash_worker": None, "show_reasoning": server._load_show_reasoning(),
                 "tool_progress_mode": server._load_tool_progress_mode(), "edit_snapshots": {},
                 "tool_started_at": {}, "model_override": frame.get("model_override"),
