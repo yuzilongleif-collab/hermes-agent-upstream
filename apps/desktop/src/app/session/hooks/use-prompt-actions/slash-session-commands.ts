@@ -221,7 +221,10 @@ export function sessionCommandHandlers<C extends { arg: string }>(env: SessionCo
     const nothing = intent === 'retry' ? copy().retryNothing : copy().undoNothing
     // The resume snapshot carries every row's durable id and primes the CAS revision/generation the
     // rewind mutation presents, as Ink's mutateCanonical does.
-    const snapshot = await requestGateway<{ messages?: SnapshotRow[] }>('session.resume', { session_id: sessionId })
+    const snapshot = await requestGateway<{ messages?: SnapshotRow[] }>('session.resume', {
+      session_id: sessionId,
+      source: 'desktop'
+    })
     const target = userTurnFromEnd(Array.isArray(snapshot?.messages) ? snapshot.messages : [], turnsBack)
 
     if (!target) {

@@ -130,6 +130,7 @@ export async function resumeStoredRuntimeSession(
     return deps.requestGateway<{ session_id: string }>('session.resume', {
       session_id: storedSessionId,
       source: 'desktop',
+      defer_history: true,
       omit_messages: true,
       ...(profile ? { profile } : {})
     })

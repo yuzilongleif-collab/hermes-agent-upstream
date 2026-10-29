@@ -229,6 +229,21 @@ describe('a row without a reachable owner', () => {
 })
 
 describe('requestForBot rides the bot’s own source', () => {
+  it.each([false, true])('marks group resumes as Desktop without changing history policy (scoped=%s)', async scoped => {
+    hostMock.request.mockResolvedValue({})
+    hostMock.requestProfile.mockResolvedValue({})
+    const bot = scoped ? hostedRow : { name: 'ops' }
+
+    for (const policy of [{}, { omit_messages: true }, { defer_history: false, omit_messages: false }]) {
+      const params = { session_id: 'group-stored', profile: 'default', ...policy }
+      await requestForBot(bot, 'session.resume', params)
+      const calls = scoped ? hostMock.requestProfile.mock.calls : hostMock.request.mock.calls
+      const sent = calls.at(-1)![scoped ? 2 : 1]
+      expect(sent).toEqual({ ...params, source: 'desktop' })
+      expect(sent).not.toHaveProperty('cwd')
+    }
+  })
+
   it('pins same-name bots to their own connection under concurrent requests', async () => {
     hostMock.requestProfile.mockImplementation(async (route: ProfileRoute) => ({ from: route.connectionId }))
 

@@ -2543,6 +2543,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith('session.resume', {
       session_id: 'stored-session-b',
       source: 'desktop',
+      defer_history: true,
       omit_messages: true
     })
     expect(requestGateway).toHaveBeenCalledWith(
@@ -2774,6 +2775,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith('session.resume', {
       session_id: 'stored-session-a',
       source: 'desktop',
+      defer_history: true,
       omit_messages: true
     })
     // The prompt must land in the resumed session, NOT the foreground.
@@ -3162,7 +3164,7 @@ describe('usePromptActions redirectPrompt', () => {
     expect(await handle!.redirectPrompt('reconnect nudge')).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['session.redirect', 'session.resume', 'session.redirect'])
     expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID, text: 'reconnect nudge' })
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
+    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', defer_history: true, omit_messages: true })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'reconnect nudge' })
     expect(handle!.activeSessionIdRef.current).toBe(RECOVERED_SESSION_ID)
   })
@@ -3998,6 +4000,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     expect(calls.find(c => c.method === 'session.resume')?.params).toEqual({
       session_id: STORED_SESSION_A,
       source: 'desktop',
+      defer_history: true,
       omit_messages: true
     })
   })
@@ -4713,7 +4716,7 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
     expect(calls).toEqual([
       {
         method: 'session.resume',
-        params: { session_id: STORED_ID, source: 'desktop', omit_messages: true }
+        params: { session_id: STORED_ID, source: 'desktop', defer_history: true, omit_messages: true }
       },
       {
         method: 'prompt.submit',
@@ -4796,7 +4799,7 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
     expect(calls).toEqual([
       {
         method: 'session.resume',
-        params: { session_id: QUEUED_STORED_ID, source: 'desktop', omit_messages: true }
+        params: { session_id: QUEUED_STORED_ID, source: 'desktop', defer_history: true, omit_messages: true }
       },
       {
         method: 'prompt.submit',

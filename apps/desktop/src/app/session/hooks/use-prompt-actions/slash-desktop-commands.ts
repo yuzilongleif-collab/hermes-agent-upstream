@@ -332,7 +332,8 @@ export function desktopReadCommandHandlers<C extends { arg: string }>(env: Deskt
         if (restore?.success && restore.history_removed && !request.params.file_path) {
           try {
             const snapshot = await requestGateway<{ messages?: SessionMessage[] }>('session.resume', {
-              session_id: out.sessionId
+              session_id: out.sessionId,
+              source: 'desktop'
             })
 
             if (Array.isArray(snapshot?.messages)) {
@@ -505,7 +506,8 @@ export function desktopReadCommandHandlers<C extends { arg: string }>(env: Deskt
 
       try {
         const snapshot = await requestGateway<{ messages?: SessionMessage[] }>('session.resume', {
-          session_id: out.sessionId
+          session_id: out.sessionId,
+          source: 'desktop'
         })
 
         out.render(formatHistory(Array.isArray(snapshot?.messages) ? snapshot.messages : []))

@@ -191,7 +191,7 @@ describe('/rollback', () => {
     expect(renderedText(handle)).toContain('REMOVED QUESTION')
 
     await handle.submitText('/rollback 1')
-    expect(callsOf(requestGateway, 'session.resume')).toEqual([{ session_id: RUNTIME_SESSION_ID }])
+    expect(callsOf(requestGateway, 'session.resume')).toEqual([{ session_id: RUNTIME_SESSION_ID, source: 'desktop' }])
     const text = renderedText(handle)
     expect(text).toContain('KEPT ANSWER')
     expect(text).not.toContain('REMOVED QUESTION')
@@ -370,7 +370,7 @@ describe('/history', () => {
 
     await handle.submitText('/history')
 
-    expect(callsOf(requestGateway, 'session.resume')).toEqual([{ session_id: RUNTIME_SESSION_ID }])
+    expect(callsOf(requestGateway, 'session.resume')).toEqual([{ session_id: RUNTIME_SESSION_ID, source: 'desktop' }])
     expect(callsOf(requestGateway, 'slash.exec')).toEqual([])
     const text = renderedText(handle)
     expect(text).toContain('You: first question')

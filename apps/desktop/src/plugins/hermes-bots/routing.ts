@@ -222,6 +222,12 @@ export async function requestForBot<T = unknown>(
 ): Promise<T> {
   const route = botConnectionRoute(bot)
 
+  // A group poll is also a Desktop attach: an omitted source can mint a TUI
+  // runtime on remote gateways. Keep each caller's transcript policy intact.
+  if (method === 'session.resume') {
+    params = { ...params, source: 'desktop' }
+  }
+
   if (route) {
     if (typeof host.requestProfile !== 'function') {
       throw new Error(`Cannot route ${method} for ${route.connectionId}::${route.profile}`)

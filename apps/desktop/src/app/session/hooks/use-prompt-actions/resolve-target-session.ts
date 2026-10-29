@@ -104,6 +104,7 @@ export async function resolveTargetSessionId(deps: ResolveTargetSessionDeps): Pr
         return requestGateway<{ session_id?: string }>('session.resume', {
           session_id: storedTarget,
           source: 'desktop',
+          defer_history: true,
           // Same contract as every other desktop resume: the response must
           // not inline a full compression lineage (deep ones exceed
           // max_resume_messages and fail assert_resume_safe). Only the

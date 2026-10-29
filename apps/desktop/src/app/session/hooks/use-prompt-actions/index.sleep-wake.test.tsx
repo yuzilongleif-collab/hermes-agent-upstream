@@ -91,7 +91,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(ok).toBe(true)
     // First submit (stale id) → session.resume (stored id) → retry submit (fresh id).
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
+    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', defer_history: true, omit_messages: true })
     expect(calls[2]?.params).toEqual({
       submission_id: expect.any(String),
       session_id: RECOVERED_SESSION_ID,
@@ -206,7 +206,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
     // First submit (stale id) → session.resume (stored id) → retry submit (fresh id).
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
+    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', defer_history: true, omit_messages: true })
     expect(calls[2]?.params).toEqual(
       expect.objectContaining({ session_id: RECOVERED_SESSION_ID, text: 'original prompt' })
     )
@@ -255,6 +255,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[1]?.params).toEqual({
       session_id: STORED_SESSION_ID,
       source: 'desktop',
+      defer_history: true,
       omit_messages: true,
       profile: 'work'
     })
@@ -307,6 +308,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[1]?.params).toEqual({
       session_id: STORED_SESSION_ID,
       source: 'desktop',
+      defer_history: true,
       omit_messages: true,
       profile: 'work'
     })
@@ -374,6 +376,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[1]?.params).toEqual({
       session_id: STORED_SESSION_ID,
       source: 'desktop',
+      defer_history: true,
       omit_messages: true
     })
     expect(calls[2]?.params).toEqual({
@@ -427,6 +430,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[1]?.params).toEqual({
       session_id: STORED_SESSION_ID,
       source: 'desktop',
+      defer_history: true,
       omit_messages: true
     })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID })
@@ -563,6 +567,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[1]?.params).toEqual({
       session_id: STORED_SESSION_ID,
       source: 'desktop',
+      defer_history: true,
       omit_messages: true
     })
     expect(calls[2]?.params).toEqual({
@@ -611,6 +616,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[0]?.params).toEqual({
       session_id: STORED_SESSION_ID,
       source: 'desktop',
+      defer_history: true,
       omit_messages: true
     })
     expect(calls[1]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID })

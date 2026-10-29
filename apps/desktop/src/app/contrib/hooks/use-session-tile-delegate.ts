@@ -43,6 +43,7 @@ import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
 import { singleFlightSessionResume } from '../../session/hooks/use-prompt-actions/single-flight-resume'
 import { markSessionRecentlyInterrupted, withSessionNotFoundResume } from '../../session/hooks/use-prompt-actions/utils'
 import type { useSessionActions } from '../../session/hooks/use-session-actions'
+import { primaryResumeParams } from '../../session/hooks/use-session-actions/resume-owner'
 import {
   chatMessageArraysEquivalent,
   overlayConcurrentMessageChanges,
@@ -465,12 +466,17 @@ export function useSessionTileDelegate({
             return singleFlightSessionResume(
               storedSessionId,
               () =>
-                requestForSessionProfile<SessionResumeResult>(owner, requestGateway, 'session.resume', {
-                  session_id: storedSessionId,
-                  cols: 96,
-                  omit_messages: !authoritativeSnapshot,
-                  ...(owner ? { profile: typeof owner === 'string' ? owner : owner.profile } : {})
-                }),
+                requestForSessionProfile<SessionResumeResult>(
+                  owner,
+                  requestGateway,
+                  'session.resume',
+                  primaryResumeParams(
+                    storedSessionId,
+                    false,
+                    authoritativeSnapshot,
+                    typeof owner === 'string' ? owner : owner?.profile
+                  )
+                ),
               { requiresMessages: authoritativeSnapshot, scope: owner }
             )
           },

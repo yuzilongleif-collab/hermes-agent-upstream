@@ -146,6 +146,7 @@ describe('/undo on a canonical session', () => {
     const handle = await mount(requestGateway)
     await handle.submitText('/undo')
 
+    expect(callsOf(requestGateway, 'session.resume')).toEqual([{ session_id: RUNTIME_SESSION_ID, source: 'desktop' }])
     expect(requestGateway.mock.calls.filter(([name]) => name === 'session.rewind').map(([, params]) => params)).toEqual(
       [
         { session_id: RUNTIME_SESSION_ID, derived_target: true, replay_only: true },

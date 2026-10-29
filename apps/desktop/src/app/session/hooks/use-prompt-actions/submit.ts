@@ -860,6 +860,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                 return requestGateway<{ session_id: string }>('session.resume', {
                   session_id: storedId,
                   source: 'desktop',
+                  defer_history: true,
                   omit_messages: true,
                   ...(resumeProfile ? { profile: resumeProfile } : {})
                 })
