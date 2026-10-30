@@ -22,13 +22,15 @@ from hermes_cli.session_listing import subagent_listing_scope
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_gateway import _strip_session_list_rows
 from hermes_cli.web_server_sessions import _session_latest_descendant
+from hermes_cli.web_session_search import SearchControl, await_search
 from hermes_cli.web_models import (
     BulkDeleteSessions, SessionImport, SessionOwnerBackfill, SessionPrune, SessionRename)
 from hermes_cli.web_routers._common import (
     CORRUPT_STORE_DETAIL, corrupt_store_as_status, log as _log, destructive_profile, http_failure,
 )
 from hermes_state import is_malformed_db_error
-from hermes_state_errors import SessionActiveWriteGuardError, StateDbReplacedError, is_transient_sqlite_error
+from hermes_state_errors import (
+    SessionActiveWriteGuardError, StateDbReplacedError, is_transient_sqlite_error, is_search_execution_error)
 from hermes_state_health import STORAGE_CORRUPT, note_storage_error, storage_state
 
 list_router = APIRouter()
@@ -135,10 +137,11 @@ def _is_active(row: dict, now: float) -> bool:
         and (now - row.get("last_active", row.get("started_at", 0))) < _ACTIVE_WINDOW_S)
 
 
-def _with_db(profile: Optional[str], fn: Callable, *, read_only: bool):
+def _with_db(profile: Optional[str], fn: Callable, *, read_only: bool, read_deadline: float | None = None):
     """Open the profile's session DB, run ``fn(db)``, always close."""
     def run():
-        db = _open_session_db_for_profile(profile, read_only=read_only)
+        kwargs = {"read_deadline": read_deadline} if read_deadline is not None else {}
+        db = _open_session_db_for_profile(profile, read_only=read_only, **kwargs)
         try:
             return fn(db)
         finally:
@@ -286,7 +289,7 @@ def _is_compression_edge(child: dict, parent: dict) -> bool:
 @search_router.get("/api/sessions/search")
 async def search_sessions(
     q: str = "", limit: int = 20, profile: Optional[str] = None, source: str | None = None,
-    sources: str | None = None, exclude_sources: str | None = None):
+    sources: str | None = None, exclude_sources: str | None = None, request: Request = None):
     """Search sessions by ID (first) plus FTS5 message content.
 
     Results are deduped by compression lineage, not raw ``session_id``:
@@ -296,10 +299,12 @@ async def search_sessions(
     """
     if not q or not q.strip():
         return {"results": []}
+    control = SearchControl()
     with http_failure("GET /api/sessions/search failed", 500, detail="Search failed"):
         row_profile = _serving_profile(profile)
 
         def _search(db):
+            control.check()
             safe_limit = max(1, min(int(limit or 20), 100))
             source_filter = source or None
             source_list = _csv(sources)
@@ -308,9 +313,12 @@ async def search_sessions(
             now = time.time()
 
             def get_session(sid):
+                control.check()
                 try:
                     return db.get_session(sid)
-                except Exception:
+                except Exception as exc:
+                    if is_search_execution_error(exc):
+                        raise
                     return None
 
             # Walk parent_session_id to the compression root, memoized per
@@ -344,9 +352,12 @@ async def search_sessions(
                 # when started at the root. Resuming from the matched id is
                 # what the CLI does and always reaches the live tip (#125041).
                 if session_id not in tip_cache:
+                    control.check()
                     try:
                         tip_cache[session_id] = db.get_compression_tip(session_id) or session_id
-                    except Exception:
+                    except Exception as exc:
+                        if is_search_execution_error(exc):
+                            raise
                         tip_cache[session_id] = session_id
                 return tip_cache[session_id]
 
@@ -366,9 +377,12 @@ async def search_sessions(
                 payload["lineage_root"] = root
                 payload["profile"] = row_profile
                 payload["is_default_profile"] = row_profile == "default"
+                control.check()
                 try:
                     row = db.get_session_rich_row(sid)
-                except Exception:
+                except Exception as exc:
+                    if is_search_execution_error(exc):
+                        raise
                     row = None
                 if row:
                     last_active = row.get("last_active") or row.get("started_at")
@@ -419,6 +433,7 @@ async def search_sessions(
                 for tok in re.findall(r'"[^"]*"|\S+', q.strip()))
             # Over-fetch so lineage dedup can still surface `limit` distinct
             # conversations when several hits collapse onto one root.
+            control.check()
             matches = db.search_messages(
                 query=prefix_query, source_filter=include_sources,
                 exclude_sources=exclude_list or None, limit=max(safe_limit * 5, 50),
@@ -438,13 +453,16 @@ async def search_sessions(
             # helper the sidebar listing uses), so reuse it rather than adding
             # a second title query path here. Best-effort: an old/odd store
             # that rejects the call just skips the lane.
+            control.check()
             if len(seen) < safe_limit:
                 try:
                     title_rows = db.list_sessions_rich(
                         search_query=q.strip(), include_archived=True, order_by_last_active=True,
                         source=source_filter, sources=source_list or None,
                         exclude_sources=exclude_list or None, limit=safe_limit)
-                except Exception:  # health: allow BLE001 -- best-effort supplement lane: an old/odd store that rejects the search_query read must not fail the id+content results already collected
+                except Exception as exc:  # health: allow BLE001 -- best-effort supplement lane: an old/odd store that rejects the search_query read must not fail the id+content results already collected
+                    if is_search_execution_error(exc):
+                        raise
                     _log.debug("Title-match supplement skipped for %r", q[: 200])
                     title_rows = []
                 for row in title_rows:
@@ -460,7 +478,9 @@ async def search_sessions(
             return {"results": list(seen.values())}
 
         # FTS over a large state.db is the slowest read here; keep it off the loop (#60747).
-        return await asyncio.to_thread(_with_db, profile, _search, read_only=True)
+        return await await_search(
+            lambda: _with_db(profile, lambda db: control.run(db, _search), read_only=True,
+                             read_deadline=control.deadline), control, request)
 
 
 @manage_router.post("/api/sessions/bulk-delete")

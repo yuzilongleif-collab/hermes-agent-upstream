@@ -6,6 +6,7 @@ import { type NativeAccessTokenOptions, NativeAuthChangedError } from './native-
 import { shouldRotateNativeTokenAfterRejection } from './native-auth-decisions'
 
 export interface OauthRestRequestDeps<T> {
+  signal?: AbortSignal
   ensureNativeAccessToken: (baseUrl: string, options?: NativeAccessTokenOptions) => Promise<string | null>
   requestWithBearer: (accessToken: string) => Promise<T>
   requestWithCookie: () => Promise<T>
@@ -42,14 +43,17 @@ function markStaleAppToken(error: unknown): void {
  * Never replay a submitted request: it may be a non-idempotent mutation.
  */
 export async function requestWithOauthFallback<T>(baseUrl: string, deps: OauthRestRequestDeps<T>): Promise<T> {
+  deps.signal?.throwIfAborted()
   let nativeAccessToken: string | null
 
   try {
     nativeAccessToken = await deps.ensureNativeAccessToken(baseUrl)
   } catch (error) {
+    deps.signal?.throwIfAborted()
     return cookieFallback(deps.requestWithCookie, error)
   }
 
+  deps.signal?.throwIfAborted()
   return nativeAccessToken ? deps.requestWithBearer(nativeAccessToken) : deps.requestWithCookie()
 }
 

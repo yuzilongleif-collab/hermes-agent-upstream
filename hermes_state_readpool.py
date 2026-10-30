@@ -69,6 +69,16 @@ _fd_usage_lock = threading.Lock()
 _fd_usage_cache: tuple[float, Optional[int]] = (0.0, None)
 
 
+def remaining_read_timeout(deadline: float | None, maximum: float) -> float:
+    """An opt-in caller deadline may shorten an RO open/retry, never extend it."""
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Session search deadline expired")
+    return min(maximum, remaining)
+
+
 def _proc_fd_targets(pid: int) -> Iterator[tuple[str, str]]:
     """Yield ``(readlink target, fd path)`` for every entry in /proc/<pid>/fd (unreadable
     links skipped). Raises OSError when the fd directory itself cannot be listed."""

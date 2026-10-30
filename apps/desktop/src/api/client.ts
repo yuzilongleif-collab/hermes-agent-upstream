@@ -692,8 +692,27 @@ export function ambientOwnerConnectionId(): string | undefined {
  *  pin — `'local'` included — so a pin always overrides the ambient tag spread
  *  underneath it. (It used to omit the key for 'local', which made the pin
  *  unable to beat the ambient tag; helpers then had to bypass this wrapper.) */
-export function hermesApi<T>(request: HermesApiRequest): Promise<T> {
-  return window.hermesDesktop.api<T>({ ...connectionScoped(), ...request })
+export async function hermesApi<T>(request: HermesApiRequest, options: { signal?: AbortSignal } = {}): Promise<T> {
+  const { signal } = options
+  signal?.throwIfAborted()
+  const bridge = window.hermesDesktop
+  if (!signal) { return bridge.api<T>({ ...connectionScoped(), ...request }) }
+  if (!bridge.cancelApi) { throw new Error('API cancellation is unavailable') }
+
+  // AbortSignal cannot cross Electron's context bridge / structured-clone IPC.
+  const requestId = crypto.randomUUID()
+  const abort = () => bridge.cancelApi!(requestId)
+  signal.addEventListener('abort', abort, { once: true })
+  try {
+    const result = await bridge.api<T>({ ...connectionScoped(), ...request, requestId })
+    signal.throwIfAborted()
+    return result
+  } catch (error) {
+    signal.throwIfAborted()
+    throw error
+  } finally {
+    signal.removeEventListener('abort', abort)
+  }
 }
 
 // ── Capability scope: (connection, profile) routing for the Capabilities

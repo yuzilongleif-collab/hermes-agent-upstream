@@ -36,6 +36,9 @@ function isExpectedNotFoundSentinel(value: unknown): value is Record<string, str
 // Restore the caller-visible contract: a sentinel becomes the rejection the
 // renderer expects; anything else passes through untouched.
 function unwrapExpectedNotFound(value: unknown): unknown {
+  if (value && typeof value === 'object' && Object.keys(value).length === 1 && (value as Record<string, unknown>).__hermesApiAborted === true) {
+    throw new DOMException('The request was aborted', 'AbortError')
+  }
   if (isExpectedNotFoundSentinel(value)) {
     throw new Error(value[HERMES_API_EXPECTED_404])
   }

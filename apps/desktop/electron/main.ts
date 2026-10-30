@@ -43,7 +43,9 @@ import {
 import type { Session } from 'electron'
 
 import { type ActiveRuntimeState, classifyActiveRuntime } from './active-runtime-state'
+import { registerCancellableApi } from './api-cancellation'
 import { HERMES_API_EXPECTED_404 } from './api-expected-404'
+import { bindRequestAbort } from './api-request-abort'
 import {
   destroyKeepaliveAgents,
   htmlResponseError,
@@ -5212,16 +5214,19 @@ function multipartBody(upload) {
 }
 
 function fetchJson(url, token, options: any = {}) {
+  options.signal?.throwIfAborted()
   // Retry policy lives in api-transport.ts: idempotent verbs retry on any
   // transient transport error; POST/PUT/DELETE only when the request provably
   // never reached the server (see shouldRetryRequest) — never double-submit.
   return withRetry(
     async (requestState: any) => {
+      options.signal?.throwIfAborted()
       // Mint inside each retry: a grant authorizes exactly one HTTP request.
       const nativeHeaders = options.gatewayDescriptor
         ? await nativeGatewayHttpHeaders(options.gatewayDescriptor, url, HERMES_HOME, options.method || 'GET', options.upload ? undefined : options.body)
         : null
 
+      options.signal?.throwIfAborted()
       return new Promise((resolve, reject) => {
         const { body, contentType } = options.upload
           ? multipartBody(options.upload)
@@ -5315,6 +5320,10 @@ function fetchJson(url, token, options: any = {}) {
           req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
         })
 
+        const unbindAbort = bindRequestAbort(options.signal, error => req.destroy(error))
+        req.once('close', unbindAbort)
+        options.signal?.throwIfAborted()
+
         // From here the request goes on the wire: a later transport error can no
         // longer prove the server didn't process it, so non-idempotent verbs must
         // not be retried past this point.
@@ -5327,7 +5336,7 @@ function fetchJson(url, token, options: any = {}) {
         req.end()
       })
     },
-    { method: options.method || 'GET' }
+    { method: options.method || 'GET', signal: options.signal }
   )
 }
 
@@ -7212,10 +7221,12 @@ function openOauthLoginWindow(
 //      vouched replay-safe (`options.replayOn401`). Anything else keeps the
 //      no-replay rule of requestWithOauthFallback.
 function fetchJsonViaOauthSession(url, options: any = {}) {
+  options.signal?.throwIfAborted()
   const partition = resolveOauthPartitionForUrl(url)
 
   const attempt = (): Promise<unknown> =>
     new Promise((resolve, reject) => {
+      options.signal?.throwIfAborted()
       const sess = getOauthSessionForUrl(url)
 
       if (!sess) {
@@ -7281,11 +7292,18 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
         reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
       }, timeoutMs)
 
+      const unbindAbort = bindRequestAbort(options.signal, error => {
+        clearTimeout(timer)
+        reject(error)
+        request.abort()
+      })
+      request.once('abort', () => { clearTimeout(timer); unbindAbort() })
+
       request.on('response', (res: Electron.IncomingMessage): void => {
         wireOauthSessionResponse(res, {
           url,
           isTimedOut: (): boolean => timedOut,
-          clearTimer: (): void => clearTimeout(timer),
+          clearTimer: (): void => { clearTimeout(timer); unbindAbort() },
           resolve,
           reject,
           onSetCookies: setCookie => remoteSessionCookies.record(partition, url, setCookie)
@@ -7297,6 +7315,7 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
         }
 
         clearTimeout(timer)
+        unbindAbort()
         reject(error)
       })
 
@@ -7308,6 +7327,7 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
     })
 
   return attempt().catch(async error => {
+    options.signal?.throwIfAborted()
     const origin = new URL(url).origin
 
     return retryCookie401WithLogin(error, options, {
@@ -10125,15 +10145,16 @@ function primaryBackendIsRemote() {
 }
 
 // GET a profile's resolved backend (remote pool or local primary), parsed JSON.
-async function fetchJsonForProfile(profile, path) {
-  return requestJsonForProfile(profile, path, 'GET')
+async function fetchJsonForProfile(profile, path, signal?: AbortSignal) {
+  return requestJsonForProfile(profile, path, 'GET', undefined, signal)
 }
 
 // Issue an arbitrary method against a profile's resolved backend, parsed JSON.
-async function requestJsonForProfile(profile: string, path: string, method: string, body?: string) {
+async function requestJsonForProfile(profile: string, path: string, method: string, body?: string, signal?: AbortSignal) {
+  signal?.throwIfAborted()
   const conn = await ensureBackend(profile)
 
-  return fetchJsonForBackend(conn, path, { method, body, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS })
+  return fetchJsonForBackend(conn, path, { method, body, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS, signal })
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -15241,8 +15262,9 @@ async function getJsonForBackend(descriptor, path, opts: any = {}) {
 async function fetchJsonForBackend(
   descriptor,
   path,
-  opts: { method?: string; body?: unknown; upload?: unknown; timeoutMs?: number; profileScoped?: boolean } = {}
+  opts: { method?: string; body?: unknown; upload?: unknown; timeoutMs?: number; profileScoped?: boolean; signal?: AbortSignal } = {}
 ) {
+  opts.signal?.throwIfAborted()
   const url = `${descriptor.baseUrl}${path}`
 
   // A native grant names one profile and the gateway refuses `all`: assemble the unified
@@ -15278,10 +15300,12 @@ async function fetchJsonForBackend(
       method: opts.method,
       body: opts.body,
       timeoutMs: opts.timeoutMs,
-      headers: descriptor.headers
+      headers: descriptor.headers,
+      signal: opts.signal
     }
 
     return requestWithOauthFallback(descriptor.baseUrl, {
+      signal: opts.signal,
       ensureNativeAccessToken,
       requestWithBearer: (bearer: string) => fetchJson(url, null, { ...options, bearer }),
       requestWithCookie: () => fetchJsonViaOauthSession(url, options)
@@ -15294,7 +15318,8 @@ async function fetchJsonForBackend(
     upload: opts.upload,
     timeoutMs: opts.timeoutMs,
     headers: descriptor.headers,
-    gatewayDescriptor: descriptor.gatewayEndpoint ? descriptor : undefined
+    gatewayDescriptor: descriptor.gatewayEndpoint ? descriptor : undefined,
+    signal: opts.signal
   })
 }
 
@@ -15646,6 +15671,7 @@ ipcMain.handle('hermes:window:readBelow', async event => {
 //   GET    /api/sessions/{id}[/messages|/mutation-snapshot|/timeline|/messages/around] → read from remote
 //   DELETE/PATCH /api/sessions/{id}      → delete/rename/archive on remote
 async function interceptSessionRequestForRemote(request, registryConnectionId = null) {
+  request?.signal?.throwIfAborted()
   if (typeof request?.path !== 'string') {
     return undefined
   }
@@ -15769,7 +15795,7 @@ async function interceptSessionRequestForRemote(request, registryConnectionId = 
       const ownerPath = remoteOwnerRoutePath(pathname, searchParams, ownerScope)
 
       if (method === 'GET') {
-        return fetchJsonForProfile(profile, ownerPath)
+        return fetchJsonForProfile(profile, ownerPath, request.signal)
       }
 
       const body = request.body && typeof request.body === 'object' ? { ...request.body } : request.body
@@ -15788,7 +15814,7 @@ async function interceptSessionRequestForRemote(request, registryConnectionId = 
       const path = `${pathname}?${passthroughParams.toString()}`
 
       if (method === 'GET') {
-        return fetchJsonForProfile(null, path)
+        return fetchJsonForProfile(null, path, request.signal)
       }
 
       const body = request.body && typeof request.body === 'object' ? { ...request.body, profile } : { profile }
@@ -16012,6 +16038,7 @@ async function dispatchRegistryApiRequest(
   routeProfile = request?.profile,
   requestProfile = request?.profile
 ) {
+  request?.signal?.throwIfAborted()
   // Claim-guarded (#90812): every registry-scoped REST call funnels through
   // here, so it can race a renderer's own WS reconnect dial for the same
   // (connectionId, profile) scope; coalescing avoids bootstrapping a second
@@ -16027,6 +16054,7 @@ async function dispatchRegistryApiRequest(
   const requestPath = pathForRegistryBackendRequest(request.path, requestProfile, connection, request?.method || 'GET')
 
   const response = await fetchJsonForBackend(connection, requestPath, {
+    signal: request.signal,
     method: request?.method,
     body: request?.body,
     upload: request?.upload,
@@ -16067,6 +16095,7 @@ function isNotFoundApiError(error) {
 }
 
 async function handleHermesApiRequest(request) {
+  request?.signal?.throwIfAborted()
   // Registry-pinned request (request.connectionId): the renderer is working
   // against a REGISTERED gateway connection, so the data — cron jobs and their
   // run sessions included — lives in THAT host's state.db, not any local
@@ -16138,6 +16167,7 @@ async function handleHermesApiRequest(request) {
     // gateway grant per attempt, and the OAuth bearer→cookie fallback that
     // survives refresh failures and login races (requestWithOauthFallback).
     const send = current => fetchJsonForBackend(current, apiRoute.requestPath, {
+      signal: request.signal,
       method: request?.method,
       body: request?.body,
       upload: request?.upload,
@@ -16188,7 +16218,7 @@ function formatApiRequestFailure(
   return `[hermes:api ${method} ${path}] ${detail}`.slice(0, 6000)
 }
 
-ipcMain.handle('hermes:api', async (_event, request) => {
+registerCancellableApi(ipcMain, async (_event, request, signal) => {
   // Hold the deletion gate for BOTH profile deletes and renames: a concurrent
   // renderer reconnect entering ensureBackend() mid-mutation would otherwise
   // respawn the old-name backend and recreate its HERMES_HOME (#45474).
@@ -16232,6 +16262,7 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     // a rejection with the identical `404: <body>` message. The renderer
     // contract is unchanged; only Electron's logging is bypassed. Every other
     // failure still rejects and still logs in full.
+    if (signal?.aborted) { return { __hermesApiAborted: true } }
     if (isNotFoundApiError(error)) {
       return { [HERMES_API_EXPECTED_404]: String((error as any)?.message ?? error) }
     }

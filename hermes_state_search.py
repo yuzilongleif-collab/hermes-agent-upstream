@@ -16,7 +16,7 @@ from functools import partial
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
-from hermes_state_errors import is_malformed_db_error
+from hermes_state_errors import is_malformed_db_error, is_search_execution_error
 from hermes_state_common import (
     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
@@ -1144,12 +1144,14 @@ class SessionSearchMixin:
         sql, params = self._fts_match_sql(table, match_query, order_by_sql, **kwargs)
         try:
             return [dict(row) for row in self._read_all(sql, params)]
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if is_search_execution_error(exc):
+                raise
             if operational_debug:
                 logger.debug(operational_debug, exc_info=True)
             return None
         except sqlite3.DatabaseError as exc:
-            if fail_open is None or not self._enter_fts_fail_open(exc):
+            if self.read_only or fail_open is None or not self._enter_fts_fail_open(exc):
                 raise
             logger.warning(
                 "%s FTS search hit a corruption error (%s); detached FTS and falling back to canonical LIKE.",
@@ -1217,7 +1219,9 @@ class SessionSearchMixin:
             return
         try:
             stale = self._read_one("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,))
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            if is_search_execution_error(exc):
+                raise
             return
         if stale is not None:
             self._fts_stale = True
@@ -1236,7 +1240,9 @@ class SessionSearchMixin:
                         rows = conn.execute(sql, list(contexts)).fetchall()
                     for row in rows:
                         contexts[row["match_id"]].append(row)
-                except Exception:
+                except Exception as exc:
+                    if is_search_execution_error(exc):
+                        raise
                     contexts = {}
                 for match in batch:
                     try:
@@ -1324,7 +1330,9 @@ class SessionSearchMixin:
             sql, params = self._fts_match_sql("messages_fts", query, **route)
             try:
                 matches = [dict(row) for row in self._read_all(sql, params)]
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as exc:
+                if is_search_execution_error(exc):
+                    raise
                 return []  # FTS5 syntax error despite sanitization
             except sqlite3.DatabaseError as exc:
                 # Corruption parent class: detach the derived indexes and answer from
@@ -1333,7 +1341,7 @@ class SessionSearchMixin:
                 # MATCH read, the same class the write path handles (#66296). OperationalError (query
                 # syntax) is a subclass caught above; this arm is the corruption parent. The existing
                 # stale-open/repair paths retain rebuild ownership.
-                if not self._enter_fts_fail_open(exc):
+                if self.read_only or not self._enter_fts_fail_open(exc):
                     raise
                 matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
 
@@ -1346,6 +1354,8 @@ class SessionSearchMixin:
                 seen_ids = {m["id"] for m in matches}
                 matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
             except sqlite3.OperationalError as exc:
+                if is_search_execution_error(exc):
+                    raise
                 logger.debug("Unindexed-gap supplement skipped: %s", exc)
 
         # unicode61 puts no boundary between Latin and adjacent CJK ("修改youer服务端" is

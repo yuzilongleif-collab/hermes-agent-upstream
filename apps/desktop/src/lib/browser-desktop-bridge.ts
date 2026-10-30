@@ -11,7 +11,7 @@ import { onBrowserFocusSession, showBrowserNotification } from '@/lib/browser-no
 import { createBrowserProfileBridge } from '@/lib/browser-profile'
 import { createBrowserSettings } from '@/lib/browser-settings'
 import { createBrowserTerminal } from '@/lib/browser-terminal'
-import { browserApi, browserBootstrap, ticketedWebsocketUrl } from '@/lib/browser-transport'
+import { createBrowserApi, browserBootstrap, ticketedWebsocketUrl } from '@/lib/browser-transport'
 import { createBrowserUiPreferences } from '@/lib/browser-ui-preferences'
 import { createBrowserUploadsBridge } from '@/lib/browser-uploads'
 import { announceWebappWindow, createBrowserWindowOpener, sessionWindowTarget } from '@/lib/browser-window'
@@ -49,7 +49,7 @@ export function installBrowserDesktopBridge(): boolean {
     announceWebappWindow()
   }
 
-  const api = <T>(request: HermesApiRequest) => browserApi<T>(bootstrap, request)
+  const { api, cancelApi, dispose } = createBrowserApi(bootstrap)
 
   // The renderer's REST door, owning session rows the way Electron's main process does: every row
   // this tab lists comes from the one gateway serving it, the `local` source the tab's sockets and
@@ -73,6 +73,7 @@ export function installBrowserDesktopBridge(): boolean {
     () => {
       objectUrls.forEach(url => URL.revokeObjectURL(url))
       objectUrls.clear()
+      dispose()
       previewUrls.clear()
     },
     { once: true }
@@ -106,6 +107,7 @@ export function installBrowserDesktopBridge(): boolean {
     ...createBrowserDesktopPluginsBridge({ api, files }),
     ...uploads,
     api: rendererApi,
+    cancelApi,
     // This renderer is built from the serving checkout, so its version is the
     // server's, read the way native Desktop reads its runtime's.
     getVersion: async () => ({

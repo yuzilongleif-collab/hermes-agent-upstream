@@ -53,6 +53,9 @@ class _ReadDB:
     """Read-only stand-in that records which thread every SessionDB call runs on."""
 
     def __init__(self, threads: list[int]):
+        import sqlite3
+        self.read_only = True
+        self._conn = sqlite3.connect(':memory:', check_same_thread=False)
         self._threads = threads
 
     def _hit(self, value=None):
@@ -84,6 +87,7 @@ class _ReadDB:
         return self._hit([])
 
     def close(self):
+        self._conn.close()
         self._hit()
 
 
@@ -101,7 +105,7 @@ def test_session_read_handlers_run_sessiondb_work_off_event_loop(monkeypatch, ca
     loop_thread = threading.get_ident()
     db_threads: list[int] = []
 
-    def _open_db(profile=None, *, read_only):
+    def _open_db(profile=None, *, read_only, **kwargs):
         assert read_only is True
         return _ReadDB(db_threads)
 

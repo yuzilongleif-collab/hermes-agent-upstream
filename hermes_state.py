@@ -49,7 +49,7 @@ from hermes_state_guard import (
     _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,
     _register_test_instance, _set_last_init_error, get_last_init_error,
 )
-from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
+from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, remaining_read_timeout
 from hermes_state_sessions import SessionSessionsMixin
 from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
 from hermes_state_portability import SessionPortabilityMixin
@@ -581,7 +581,7 @@ class SessionDB(
         except Exception as exc:
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
 
-    def __init__(self, db_path: Path | None = None, read_only: bool = False):
+    def __init__(self, db_path: Path | None = None, read_only: bool = False, *, read_deadline: float | None = None):
         self.db_path = db_path or _default_db_path()
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
@@ -652,7 +652,7 @@ class SessionDB(
         initialization_complete = False
         try:
             if read_only:
-                self._open_read_only()
+                self._open_read_only(deadline=read_deadline)
             else:
                 # Where SQLite's close-time checkpoint cannot be switched off, a lost-generation handle
                 # is retired unclosed (see close()). Resolve that capability before opening a writer:
@@ -730,7 +730,7 @@ class SessionDB(
             # (howtocorrupt §2.2); these survive it. Lifted in close().
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
-    def _open_read_only(self) -> None:
+    def _open_read_only(self, *, deadline: float | None = None) -> None:
         """Read-only attach for cross-profile aggregation: no schema init, NO write
         lock (sidebar polling never contends with that profile's backend); the DB
         must exist. FTS flags are probed with SELECTs only, and the connection is
@@ -738,8 +738,11 @@ class SessionDB(
         leaked tracked connection cannot block the forensic backup the writable heal takes next."""
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
-                self._conn = conn = self._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
+                self._conn = conn = self._connect_read_only(
+                    timeout=remaining_read_timeout(deadline, 0.1 if deadline is not None else _READ_BUSY_TIMEOUT_S))
                 try:
+                    if deadline is not None:
+                        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
                     apply_database_pragmas(conn, db_label="state.db")
                     cursor = conn.cursor()
                     self._fts_enabled = self._fts_table_probe(cursor, "messages_fts") is True
@@ -747,6 +750,7 @@ class SessionDB(
                         self._trigram_available = (
                             self._fts_table_probe(cursor, "messages_fts_trigram") is True
                         )
+                    remaining_read_timeout(deadline, _READ_BUSY_TIMEOUT_S)
                 except BaseException:
                     self._conn = None
                     self._close_connection_quietly(conn)
@@ -759,10 +763,11 @@ class SessionDB(
                 # classifying the store as failed (#100436; see _READ_ONLY_IOERR_RETRY_ATTEMPTS).
                 # A lock is NOT retried here: the connection already waited _READ_BUSY_TIMEOUT_S,
                 # and a retry would multiply that wait on blocking callers (TUI, `hermes status`).
+                remaining_read_timeout(deadline, _READ_BUSY_TIMEOUT_S)
                 transient = _DISK_IO_ERROR_MARKER in str(ioerr).lower()
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or not transient:
                     raise
-                time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
+                time.sleep(remaining_read_timeout(deadline, _READ_ONLY_IOERR_RETRY_BACKOFF_S))
 
     def _connect_read_only(self, timeout: float) -> sqlite3.Connection:
         """``mode=ro`` tracked connection with Row factory. check_same_thread=False: pooled connections

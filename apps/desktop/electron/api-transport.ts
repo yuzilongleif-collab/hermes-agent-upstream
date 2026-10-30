@@ -147,11 +147,13 @@ async function withRetry(makeAttempt, options: any = {}) {
   let lastError
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    options.signal?.throwIfAborted()
     const requestState = { bodySent: false }
 
     try {
       return await makeAttempt(requestState)
     } catch (error) {
+      options.signal?.throwIfAborted()
       lastError = error
 
       if (attempt < maxRetries && shouldRetryRequest(error, method, requestState)) {

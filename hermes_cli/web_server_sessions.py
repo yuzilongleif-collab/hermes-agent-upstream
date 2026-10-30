@@ -343,7 +343,7 @@ def _session_db_read_probe_statements() -> tuple:
     return schema_read_probe_statements()
 
 
-def _open_session_db_at_path(db_path: Path, *, read_only: bool):
+def _open_session_db_at_path(db_path: Path, *, read_only: bool, read_deadline: float | None = None):
     """Browsing never initializes or repairs the owner's session store.
 
     Owner startup reconciles schema. The one write a browse may do: a store that lags
@@ -376,15 +376,23 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
     )
 
     def _open_probed():
-        db = SessionDB(db_path=db_path, read_only=True)
+        kwargs = {"read_deadline": read_deadline} if read_deadline is not None else {}
+        db = SessionDB(db_path=db_path, read_only=True, **kwargs)
         try:
             conn = getattr(db, "_conn", None)
             if conn is not None:
                 for statement in _session_db_read_probe_statements():
+                    if read_deadline is not None and time.monotonic() >= read_deadline:
+                        raise TimeoutError("Session search deadline expired")
+                    if read_deadline is not None:
+                        remaining_ms = int(min(0.1, read_deadline - time.monotonic()) * 1000)
+                        conn.execute(f"PRAGMA busy_timeout={max(0, remaining_ms)}")
                     conn.execute(statement).fetchone()
             return db
-        except BaseException:
+        except BaseException as exc:
             db.close()
+            if read_deadline is not None and time.monotonic() >= read_deadline:
+                raise TimeoutError("Session search deadline expired") from exc
             raise
 
     try:
@@ -396,6 +404,9 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             # owns it. Never destructive: additive DDL only, no repair from browse.
             if not is_declarative_drift_error(exc):
                 raise
+            if read_deadline is not None:
+                # Search's short read budget cannot own schema reconciliation.
+                raise HTTPException(status_code=503, detail="Session store schema requires owner startup") from exc
             try:
                 reconcile_drift_for_browse(db_path)
             except DeclarativeDriftError as drift:
@@ -430,12 +441,13 @@ def _session_db_path_for_profile(profile: Optional[str]) -> Path:
     return Path(_default_db_path())
 
 
-def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
+def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool, read_deadline: float | None = None):
     """Open a SessionDB for ``profile`` (None/empty = this process's own state.db).
 
     Access-mode semantics: see :func:`_open_session_db_at_path`.
     """
-    return _open_session_db_at_path(_session_db_path_for_profile(profile), read_only=read_only)
+    kwargs = {"read_deadline": read_deadline} if read_deadline is not None else {}
+    return _open_session_db_at_path(_session_db_path_for_profile(profile), read_only=read_only, **kwargs)
 
 
 # In-process throttle for the opportunistic auto-archive trigger, keyed by
