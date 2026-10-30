@@ -581,7 +581,8 @@ class SessionDB(
         except Exception as exc:
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
 
-    def __init__(self, db_path: Path | None = None, read_only: bool = False, *, read_deadline: float | None = None):
+    def __init__(self, db_path: Path | None = None, read_only: bool = False, *, read_deadline: float | None = None,
+                 read_cancel_check: Callable[[], None] | None = None):
         self.db_path = db_path or _default_db_path()
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
@@ -652,7 +653,7 @@ class SessionDB(
         initialization_complete = False
         try:
             if read_only:
-                self._open_read_only(deadline=read_deadline)
+                self._open_read_only(deadline=read_deadline, cancel_check=read_cancel_check)
             else:
                 # Where SQLite's close-time checkpoint cannot be switched off, a lost-generation handle
                 # is retired unclosed (see close()). Resolve that capability before opening a writer:
@@ -730,44 +731,53 @@ class SessionDB(
             # (howtocorrupt §2.2); these survive it. Lifted in close().
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
-    def _open_read_only(self, *, deadline: float | None = None) -> None:
-        """Read-only attach for cross-profile aggregation: no schema init, NO write
-        lock (sidebar polling never contends with that profile's backend); the DB
-        must exist. FTS flags are probed with SELECTs only, and the connection is
-        closed on ANY probe failure (malformed schema raises DatabaseError) so a
-        leaked tracked connection cannot block the forensic backup the writable heal takes next."""
-        for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
+    def _open_read_only(self, *, deadline: float | None = None,
+                        cancel_check: Callable[[], None] | None = None) -> None:
+        """Read-only attach: no schema init or writer fallback; close on probe failure.
+
+        An optional operation check also covers open/probes/retry, not only later SQL.
+        """
+        def check():
+            if cancel_check is not None:
+                cancel_check()
+            remaining_read_timeout(deadline, _READ_BUSY_TIMEOUT_S)
+
+        def progress():
             try:
-                self._conn = conn = self._connect_read_only(
-                    timeout=remaining_read_timeout(deadline, 0.1 if deadline is not None else _READ_BUSY_TIMEOUT_S))
+                check()
+            except (InterruptedError, TimeoutError):
+                return 1
+            return 0
+
+        for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
+            check()
+            try:
+                self._conn = conn = self._connect_read_only(timeout=remaining_read_timeout(
+                    deadline, 0.1 if deadline is not None or cancel_check is not None else _READ_BUSY_TIMEOUT_S))
                 try:
-                    if deadline is not None:
-                        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                    if deadline is not None or cancel_check is not None:
+                        conn.set_progress_handler(progress, 1000)
+                    check()
                     apply_database_pragmas(conn, db_label="state.db")
                     cursor = conn.cursor()
                     self._fts_enabled = self._fts_table_probe(cursor, "messages_fts") is True
+                    check()
                     if self._fts_enabled:
-                        self._trigram_available = (
-                            self._fts_table_probe(cursor, "messages_fts_trigram") is True
-                        )
-                    remaining_read_timeout(deadline, _READ_BUSY_TIMEOUT_S)
+                        self._trigram_available = self._fts_table_probe(cursor, "messages_fts_trigram") is True
+                    check()
                 except BaseException:
                     self._conn = None
                     self._close_connection_quietly(conn)
+                    check()
                     raise
                 return
             except sqlite3.OperationalError as ioerr:
-                # In-flight WAL checkpoint/reset/frame-flush on the writer side can surface
-                # SQLITE_IOERR to a mode=ro reader (it can't do the -shm recovery the read
-                # needs). Closes in milliseconds: retry a bounded number of times before
-                # classifying the store as failed (#100436; see _READ_ONLY_IOERR_RETRY_ATTEMPTS).
-                # A lock is NOT retried here: the connection already waited _READ_BUSY_TIMEOUT_S,
-                # and a retry would multiply that wait on blocking callers (TUI, `hermes status`).
-                remaining_read_timeout(deadline, _READ_BUSY_TIMEOUT_S)
+                check()
                 transient = _DISK_IO_ERROR_MARKER in str(ioerr).lower()
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or not transient:
                     raise
                 time.sleep(remaining_read_timeout(deadline, _READ_ONLY_IOERR_RETRY_BACKOFF_S))
+                check()
 
     def _connect_read_only(self, timeout: float) -> sqlite3.Connection:
         """``mode=ro`` tracked connection with Row factory. check_same_thread=False: pooled connections

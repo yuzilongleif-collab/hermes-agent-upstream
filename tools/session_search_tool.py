@@ -11,12 +11,15 @@ No LLM calls — every shape returns actual DB messages.
 import json
 import logging
 import re
+import sqlite3
 import time
 from datetime import datetime, timezone, UTC
 from typing import Any, Dict, List, Optional, Union
 
 from hermes_state_common import _BOUNDARY_END_REASONS
+from hermes_state_errors import is_search_execution_error
 from hermes_time import safe_strftime
+from tools.session_search_cancellation import discovery_active
 
 # Hidden from browsing/searching — integrations (HERMES_SESSION_SOURCE=tool), delegate
 # subagent runs, kanban workers are not the user's history.
@@ -61,6 +64,8 @@ def _quiet(fn, default, msg, *log_args, with_exc: bool = False):
     try:
         return fn()
     except Exception as e:
+        if discovery_active.get() and (isinstance(e, (InterruptedError, TimeoutError)) or is_search_execution_error(e)):
+            raise
         logging.debug(msg, *(log_args + (e,) if with_exc else log_args), exc_info=True)
         return default
 
@@ -71,6 +76,8 @@ def _loud(fn, log_msg, error_prefix, *log_args):
     try:
         return fn(), None
     except Exception as e:
+        if discovery_active.get() and (isinstance(e, (InterruptedError, TimeoutError)) or is_search_execution_error(e)):
+            raise
         logging.error(log_msg, *log_args, e, exc_info=True)
         return None, tool_error(f"{error_prefix}: {e}", success=False)
 
@@ -333,6 +340,8 @@ def _hydrate_hit(db, lineage_root: str, match_info: dict[str, Any], result_detai
     try:
         view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
     except Exception as e:
+        if discovery_active.get() and (isinstance(e, (InterruptedError, TimeoutError)) or is_search_execution_error(e)):
+            raise
         logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
         return None
     session_meta, full = _get_session_meta(db, lineage_root), result_detail == "full"
@@ -431,7 +440,7 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
         "session_search(session_id=..., around_message_id=match_message_id)."))
 
 
-def _resolve_profile_db(profile: str):
+def _resolve_profile_db(profile: str | None, *, cancel_check=None):
     """Another profile's ``state.db`` opened read-only (safe on a live DB); None = current."""
     if profile is None or not str(profile).strip():
         return None
@@ -441,7 +450,8 @@ def _resolve_profile_db(profile: str):
     profiles_mod.validate_profile_name(canon)
     if not profiles_mod.profile_exists(canon):
         raise ValueError(f"profile '{canon}' does not exist")
-    return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
+    kwargs = {"read_cancel_check": cancel_check} if cancel_check is not None else {}
+    return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True, **kwargs)
 
 
 def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_profile: str | None = None) -> str:
@@ -598,10 +608,11 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
         exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids))
 
 
-def session_search(query: str = "", role_filter: str | None = None, limit: int = 3, db=None,
+def _session_search_impl(query: str = "", role_filter: str | None = None, limit: int = 3, db=None,
                    current_session_id: str | None = None, session_id: str | None = None, around_message_id: int | None = None,
                    window: int = 5, sort: str | None = None, profile: str | None = None, detail: str = "adaptive",
-                   after: str | None = None, before: str | None = None, exclude_session_ids: Optional[list[str]] = None) -> str:
+                   after: str | None = None, before: str | None = None, exclude_session_ids: Optional[list[str]] = None,
+                   control=None) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
     from hermes_constants import get_hermes_home
@@ -619,8 +630,12 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int =
     # Cross-profile: swap in the named profile's DB (read-only) for every shape;
     # current-lineage guards key off ids that won't collide, so they stay inert.
     try:
-        profile_db = _resolve_profile_db(profile)
+        profile_db = _resolve_profile_db(profile, cancel_check=control.check) if control else _resolve_profile_db(profile)
     except Exception as e:
+        if control:
+            control.check()
+        if discovery_active.get() and (isinstance(e, (InterruptedError, TimeoutError)) or is_search_execution_error(e)):
+            raise
         logging.debug("session_search: cannot open profile %r", profile, exc_info=True)
         return tool_error(f"profile '{profile}': {e}", success=False)
     if profile_db is not None:
@@ -635,19 +650,70 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int =
         db = None
     if db is None:
         db = _quiet(
-            lambda: SessionDB(db_path=get_hermes_home() / "state.db", read_only=True),
+            lambda: SessionDB(db_path=get_hermes_home() / "state.db", read_only=True,
+                             **({"read_cancel_check": control.check} if control else {})),
             None, "SessionDB unavailable for session_search",
         )
         if db is None:
             return tool_error(format_session_db_unavailable(), success=False)
         owned_dbs.append(db)
     try:
-        return _dispatch(query, role_filter, limit, db, current_session_id, session_id,
-                         around_message_id, window, sort, profile, detail,
-                         after=after, before=before, exclude_session_ids=exclude_session_ids)
+        preserve_cjk = False
+        if control and isinstance(db, SessionDB) and db not in owned_dbs:
+            from tools.session_search_cancellation import discovery_db_path
+            preserve_cjk = db._fts_cjk_available
+            db = SessionDB(db_path=discovery_db_path(db), read_only=True, read_cancel_check=control.check)
+            owned_dbs.append(db)
+        def dispatch(store):
+            return _dispatch(query, role_filter, limit, store, current_session_id, session_id,
+                             around_message_id, window, sort, profile, detail,
+                             after=after, before=before, exclude_session_ids=exclude_session_ids)
+        return control.run(db, dispatch, preserve_cjk=preserve_cjk) if control and isinstance(db, SessionDB) else dispatch(db)
     finally:
         for owned_db in reversed(owned_dbs):
-            _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
+            # Cancellation must never skip the native tracked-connection close.
+            if not control:
+                _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
+                continue
+            try:
+                if owned_db._conn is not None:
+                    owned_db._conn.set_progress_handler(None, 0)
+            finally:
+                release_or_close(owned_db)
+
+
+def session_search(query: str = "", role_filter: str | None = None, limit: int = 3, db=None,
+                   current_session_id: str | None = None, session_id: str | None = None, around_message_id: int | None = None,
+                   window: int = 5, sort: str | None = None, profile: str | None = None, detail: str = "adaptive",
+                   after: str | None = None, before: str | None = None, exclude_session_ids: Optional[list[str]] = None) -> str:
+    """Discovery consumes the native executor interrupt without changing its timeout."""
+    from tools.session_search_cancellation import DiscoveryCancellation
+    discovery = not (isinstance(session_id, str) and session_id.strip()) and isinstance(query, str) and bool(query.strip())
+    control = DiscoveryCancellation() if discovery else None
+    token = discovery_active.set(discovery)
+    try:
+        if control:
+            control.check()
+        result = _session_search_impl(query, role_filter, limit, db, current_session_id, session_id,
+                                    around_message_id, window, sort, profile, detail, after, before,
+                                    exclude_session_ids, control=control)
+        if control:
+            control.check()
+        return result
+    except InterruptedError:
+        return tool_error("Session search interrupted", success=False, code="session_search_cancelled")
+    except TimeoutError:
+        return tool_error("Session search timed out", success=False, code="session_search_timeout")
+    except sqlite3.Error:
+        if control:
+            return tool_error("Session search storage unavailable", success=False, code="session_search_unavailable")
+        raise
+    except ValueError:
+        if control:
+            return tool_error("Session search database cannot be reopened", success=False, code="session_search_unavailable")
+        raise
+    finally:
+        discovery_active.reset(token)
 
 
 def check_session_search_requirements() -> bool:
