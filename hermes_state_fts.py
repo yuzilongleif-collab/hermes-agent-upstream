@@ -1,5 +1,5 @@
 """FTS5 index setup for SessionDB: the CJK-bigram (cjk_unicode61) index DDL and
-tokenizer loader, per-table schema ensure with tokenizer-capability fallback,
+tokenizer loader and read-only readiness, per-table schema ensure with tokenizer-capability fallback,
 FTS-scoped corruption detection and the atomic fail-open trigger detach."""
 
 import logging
@@ -348,6 +348,63 @@ class SessionFtsSetupMixin:
             self.db_path,
             exc,
         )
+
+    def _probe_read_only_cjk(self, cursor: sqlite3.Cursor) -> bool:
+        """Operational readiness of a managed index, not a coverage/integrity audit.
+
+        No schema ensure, counts or repair: the native writer/backfill owns completeness.
+        A storage-version stamp only describes base/trigram, never this optional index.
+        """
+        objects = {
+            (kind, name): _stored_form(sql)
+            for kind, name, sql in cursor.execute(
+                "SELECT type, name, sql FROM sqlite_master WHERE name IN "
+                "('state_meta', 'messages_fts_cjk', 'messages_fts_cjk_src', "
+                "'messages_fts_cjk_insert', 'messages_fts_cjk_delete', 'messages_fts_cjk_update')"
+            ).fetchall()
+        }
+        if ('table', 'state_meta') not in objects:
+            return False
+        markers = cursor.execute(
+            "SELECT key FROM state_meta WHERE key IN (?, ?, ?, ?)",
+            (FTS_STALE_KEY, FTS_CJK_STALE_KEY, 'fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress'),
+        ).fetchall()
+        if markers:
+            if any(row[0] == FTS_STALE_KEY for row in markers):
+                self._fts_stale = True
+                self._fts_enabled = self._trigram_available = False
+            return False
+        expected = {
+            ('table', 'messages_fts_cjk'): _expected_vtable_sql(FTS_CJK_TABLE_SQL, 'messages_fts_cjk'),
+            ('view', 'messages_fts_cjk_src'): _expected_stored_sql(FTS_CJK_TABLE_SQL, 'VIEW', 'messages_fts_cjk_src'),
+        }
+        for name in _FTS_CJK_TRIGGERS:
+            start = FTS_CJK_TRIGGER_SQL.index(f'CREATE TRIGGER IF NOT EXISTS {name}')
+            end = FTS_CJK_TRIGGER_SQL.index('END;', start) + 3
+            expected[('trigger', name)] = _stored_form(
+                FTS_CJK_TRIGGER_SQL[start:end].replace(' IF NOT EXISTS', '', 1))
+        if any(objects.get(key) != sql for key, sql in expected.items()):
+            return False
+        return self._fts_table_probe(cursor, 'messages_fts_cjk') is True
+
+    def _read_only_cjk_matches(self, sql: str, params: Sequence) -> list[dict] | None:
+        """Readiness and MATCH share a short snapshot on the actual executing reader.
+
+        An unfinished SELECT pins SQLite's implicit read transaction until finalize.
+        Closing that cursor needs no SQL/progress callback, unlike ROLLBACK, which
+        a still-cancelled caller handler can interrupt and leave a transaction open.
+        An explicit caller transaction is neither committed nor rolled back.
+        """
+        def read(conn):
+            snapshot = conn.execute('SELECT name FROM sqlite_master LIMIT 1')
+            try:
+                self._fts_cjk_available = self._probe_read_only_cjk(conn.cursor())
+                if not self._fts_cjk_available:
+                    return None
+                return [dict(row) for row in conn.execute(sql, params).fetchall()]
+            finally:
+                snapshot.close()
+        return self._read_retrying_ioerr(read)
 
     def _ensure_fts_cjk_schema(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index (see the module comment).

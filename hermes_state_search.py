@@ -1143,6 +1143,8 @@ class SessionSearchMixin:
         search never runs the unbounded rebuild. Other ``DatabaseError``s propagate."""
         sql, params = self._fts_match_sql(table, match_query, order_by_sql, **kwargs)
         try:
+            if table == 'messages_fts_cjk' and self.read_only:
+                return self._read_only_cjk_matches(sql, params)
             return [dict(row) for row in self._read_all(sql, params)]
         except sqlite3.OperationalError as exc:
             if is_search_execution_error(exc):
@@ -1372,7 +1374,7 @@ class SessionSearchMixin:
             # cjk index, same exclusion as trigram), - queries containing a LONE 1-char CJK run: the index
             # stores bigrams for runs >=2, so a single-char term can only match isolated chars — LIKE
             # substring semantics are broader.
-            if self._fts_cjk_available:
+            if self._fts_cjk_available or (self.read_only and self._fts_cjk_loaded):
                 matches = self._match_rows("messages_fts_cjk", fb_query, **route) or matches
             if not matches and self._trigram_available and self._trigram_eligible_tokens(query):
                 matches = self._match_rows("messages_fts_trigram", fb_query, **route) or matches
@@ -1402,7 +1404,8 @@ class SessionSearchMixin:
         non-operator token so "广西 OR 桂林 OR 漓江" matches each term."""
         raw_query = _strip_cjk_wildcards(query).strip('"').strip()
         match_query = _quote_fts_tokens(raw_query)
-        if self._fts_cjk_available and not wants_unindexed_rows and not self._has_lone_cjk_run(raw_query):
+        if ((self._fts_cjk_available or (self.read_only and self._fts_cjk_loaded))
+                and not wants_unindexed_rows and not self._has_lone_cjk_run(raw_query)):
             matches = self._match_rows(
                 "messages_fts_cjk", match_query, fail_open="CJK-bigram",
                 operational_debug="messages_fts_cjk query failed; falling back to trigram/LIKE", **route)

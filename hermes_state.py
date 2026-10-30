@@ -765,6 +765,12 @@ class SessionDB(
                     if self._fts_enabled:
                         self._trigram_available = self._fts_table_probe(cursor, "messages_fts_trigram") is True
                     check()
+                    # Only the trusted process/profile loader chooses executable code;
+                    # db_path (including foreign profiles) selects data, never a library.
+                    self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
+                    check()
+                    self._fts_cjk_available = self._fts_cjk_loaded and self._probe_read_only_cjk(cursor)
+                    check()
                 except BaseException:
                     self._conn = None
                     self._close_connection_quietly(conn)
