@@ -185,6 +185,7 @@ import {
   SidebarBlankState,
   SidebarLoadErrorState,
   SidebarPinnedEmptyState,
+  SidebarSearchEmptyState,
   SidebarSessionSkeletons,
   SidebarStorageCorruptNotice
 } from './section-states'
@@ -742,7 +743,8 @@ export function ChatSidebar({
     [isPinnedSession, filtersNarrow, sessionMatchesFilters]
   )
 
-  const { searchPending, serverMatches, searchError, searchTimedOut } = useServerSessionSearch(trimmedQuery, profileScope)
+  const serverSearch = useServerSessionSearch(trimmedQuery, profileScope)
+  const { searchPending, serverMatches, searchError } = serverSearch
 
   const searchResults = useMemo(
     () => mergeSearchResults(sortedSessions, trimmedQuery, serverMatches, sessionByAnyId, searchPending),
@@ -1729,15 +1731,7 @@ export function ChatSidebar({
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
                 contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y)}
-                emptyState={
-                  searchPending ? (
-                    <SidebarSessionSkeletons />
-                  ) : (
-                    <div className="wrap-anywhere grid min-h-24 place-items-center rounded-lg px-2 text-center text-xs text-(--ui-text-tertiary)">
-                      {searchTimedOut ? t.boot.causes.timedOut : searchError ? s.projectLoadFailed : s.noMatch(trimmedQuery)}
-                    </div>
-                  )
-                }
+                emptyState={<SidebarSearchEmptyState query={trimmedQuery} search={serverSearch} />}
                 forceEmptyState={searchError}
                 label={s.results}
                 onArchiveSession={onArchiveSession}

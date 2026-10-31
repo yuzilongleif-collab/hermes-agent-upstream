@@ -11,6 +11,7 @@ import { cn } from '@/lib/utils'
 import { $corruptSessionStores } from '@/store/session'
 
 import { SidebarRowCluster, SidebarRowShell, SidebarRowStack } from './chrome'
+import type { ServerSessionSearch } from './use-server-session-search'
 
 // Stands in for session rows, so it borrows their chrome instead of copying
 // the grid — a placeholder on a different edge than the rows it resolves into
@@ -26,6 +27,24 @@ export function SidebarSessionSkeletons() {
         </SidebarRowShell>
       ))}
     </SidebarRowStack>
+  )
+}
+
+interface SidebarSearchEmptyStateProps {
+  query: string
+  search: ServerSessionSearch
+}
+
+export function SidebarSearchEmptyState({ query, search }: SidebarSearchEmptyStateProps) {
+  const { t } = useI18n()
+  const { searchPending, searchError, searchTimedOut } = search
+
+  return searchPending ? (
+    <SidebarSessionSkeletons />
+  ) : (
+    <div className="wrap-anywhere grid min-h-24 place-items-center rounded-lg px-2 text-center text-xs text-(--ui-text-tertiary)">
+      {searchTimedOut ? t.boot.causes.timedOut : searchError ? t.sidebar.projectLoadFailed : t.sidebar.noMatch(query)}
+    </div>
   )
 }
 
