@@ -352,6 +352,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // (Electron logs a stack for every rejected invoke). Turn it back into the
   // rejection the renderer expects — see electron/api-expected-404.ts.
   api: request => ipcRenderer.invoke('hermes:api', request).then(unwrapExpectedNotFound),
+  cancelApi: (requestId: string) => ipcRenderer.send('hermes:api:cancel', requestId),
   notify: payload => ipcRenderer.invoke('hermes:notify', payload),
   claimStartupLatency: () => ipcRenderer.invoke('hermes:startup-latency:claim'),
   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),

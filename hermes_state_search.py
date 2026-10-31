@@ -16,7 +16,7 @@ from functools import partial
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
-from hermes_state_errors import is_malformed_db_error
+from hermes_state_errors import is_malformed_db_error, is_search_execution_error
 from hermes_state_common import (
     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
@@ -1143,13 +1143,17 @@ class SessionSearchMixin:
         search never runs the unbounded rebuild. Other ``DatabaseError``s propagate."""
         sql, params = self._fts_match_sql(table, match_query, order_by_sql, **kwargs)
         try:
+            if table == 'messages_fts_cjk' and self.read_only:
+                return self._read_only_cjk_matches(sql, params)
             return [dict(row) for row in self._read_all(sql, params)]
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if is_search_execution_error(exc):
+                raise
             if operational_debug:
                 logger.debug(operational_debug, exc_info=True)
             return None
         except sqlite3.DatabaseError as exc:
-            if fail_open is None or not self._enter_fts_fail_open(exc):
+            if self.read_only or fail_open is None or not self._enter_fts_fail_open(exc):
                 raise
             logger.warning(
                 "%s FTS search hit a corruption error (%s); detached FTS and falling back to canonical LIKE.",
@@ -1217,7 +1221,9 @@ class SessionSearchMixin:
             return
         try:
             stale = self._read_one("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,))
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            if is_search_execution_error(exc):
+                raise
             return
         if stale is not None:
             self._fts_stale = True
@@ -1236,7 +1242,9 @@ class SessionSearchMixin:
                         rows = conn.execute(sql, list(contexts)).fetchall()
                     for row in rows:
                         contexts[row["match_id"]].append(row)
-                except Exception:
+                except Exception as exc:
+                    if is_search_execution_error(exc):
+                        raise
                     contexts = {}
                 for match in batch:
                     try:
@@ -1324,7 +1332,9 @@ class SessionSearchMixin:
             sql, params = self._fts_match_sql("messages_fts", query, **route)
             try:
                 matches = [dict(row) for row in self._read_all(sql, params)]
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as exc:
+                if is_search_execution_error(exc):
+                    raise
                 return []  # FTS5 syntax error despite sanitization
             except sqlite3.DatabaseError as exc:
                 # Corruption parent class: detach the derived indexes and answer from
@@ -1333,7 +1343,7 @@ class SessionSearchMixin:
                 # MATCH read, the same class the write path handles (#66296). OperationalError (query
                 # syntax) is a subclass caught above; this arm is the corruption parent. The existing
                 # stale-open/repair paths retain rebuild ownership.
-                if not self._enter_fts_fail_open(exc):
+                if self.read_only or not self._enter_fts_fail_open(exc):
                     raise
                 matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
 
@@ -1346,6 +1356,8 @@ class SessionSearchMixin:
                 seen_ids = {m["id"] for m in matches}
                 matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
             except sqlite3.OperationalError as exc:
+                if is_search_execution_error(exc):
+                    raise
                 logger.debug("Unindexed-gap supplement skipped: %s", exc)
 
         # unicode61 puts no boundary between Latin and adjacent CJK ("修改youer服务端" is
@@ -1362,7 +1374,7 @@ class SessionSearchMixin:
             # cjk index, same exclusion as trigram), - queries containing a LONE 1-char CJK run: the index
             # stores bigrams for runs >=2, so a single-char term can only match isolated chars — LIKE
             # substring semantics are broader.
-            if self._fts_cjk_available:
+            if self._fts_cjk_available or (self.read_only and self._fts_cjk_loaded):
                 matches = self._match_rows("messages_fts_cjk", fb_query, **route) or matches
             if not matches and self._trigram_available and self._trigram_eligible_tokens(query):
                 matches = self._match_rows("messages_fts_trigram", fb_query, **route) or matches
@@ -1392,7 +1404,8 @@ class SessionSearchMixin:
         non-operator token so "广西 OR 桂林 OR 漓江" matches each term."""
         raw_query = _strip_cjk_wildcards(query).strip('"').strip()
         match_query = _quote_fts_tokens(raw_query)
-        if self._fts_cjk_available and not wants_unindexed_rows and not self._has_lone_cjk_run(raw_query):
+        if ((self._fts_cjk_available or (self.read_only and self._fts_cjk_loaded))
+                and not wants_unindexed_rows and not self._has_lone_cjk_run(raw_query)):
             matches = self._match_rows(
                 "messages_fts_cjk", match_query, fail_open="CJK-bigram",
                 operational_debug="messages_fts_cjk query failed; falling back to trigram/LIKE", **route)

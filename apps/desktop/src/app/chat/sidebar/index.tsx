@@ -742,7 +742,7 @@ export function ChatSidebar({
     [isPinnedSession, filtersNarrow, sessionMatchesFilters]
   )
 
-  const { searchPending, serverMatches } = useServerSessionSearch(trimmedQuery, profileScope)
+  const { searchPending, serverMatches, searchError, searchTimedOut } = useServerSessionSearch(trimmedQuery, profileScope)
 
   const searchResults = useMemo(
     () => mergeSearchResults(sortedSessions, trimmedQuery, serverMatches, sessionByAnyId, searchPending),
@@ -1734,10 +1734,11 @@ export function ChatSidebar({
                     <SidebarSessionSkeletons />
                   ) : (
                     <div className="wrap-anywhere grid min-h-24 place-items-center rounded-lg px-2 text-center text-xs text-(--ui-text-tertiary)">
-                      {s.noMatch(trimmedQuery)}
+                      {searchTimedOut ? t.boot.causes.timedOut : searchError ? s.projectLoadFailed : s.noMatch(trimmedQuery)}
                     </div>
                   )
                 }
+                forceEmptyState={searchError}
                 label={s.results}
                 onArchiveSession={onArchiveSession}
                 onBranchSession={onBranchSession}

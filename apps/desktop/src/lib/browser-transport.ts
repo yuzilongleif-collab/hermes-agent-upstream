@@ -1,4 +1,5 @@
 import { BROWSER_NATIVE_DIAL, buildHermesWebSocketUrl, normalizeBasePath } from '@hermes/shared'
+import { CancellableApiRequests } from '../../../shared/src/api-cancellation'
 
 import type { HermesApiRequest } from '@/global'
 import { readWebappSession, webappSignInRequired } from '@/lib/browser-launch-session'
@@ -141,7 +142,8 @@ interface BrowserFetchRequest {
 
 export async function browserFetch(
   bootstrap: BrowserBootstrap,
-  request: BrowserFetchRequest
+  request: BrowserFetchRequest,
+  signal?: AbortSignal
 ): Promise<{ response: Response; text: string }> {
   if (!bootstrap.authRequired && !bootstrap.token) {throw webappSignInRequired()}
 
@@ -157,7 +159,7 @@ export async function browserFetch(
       credentials: 'same-origin',
       headers,
       method: request.method || 'GET',
-      signal: controller?.signal
+      signal: controller ? AbortSignal.any([controller.signal, ...(signal ? [signal] : [])]) : signal
     })
 
     const text = await response.text()
@@ -179,7 +181,16 @@ export async function browserFetch(
   }
 }
 
-export async function browserApi<T>(bootstrap: BrowserBootstrap, request: HermesApiRequest): Promise<T> {
+export function createBrowserApi(bootstrap: BrowserBootstrap) {
+  const requests = new CancellableApiRequests()
+  return {
+    api: <T>(request: HermesApiRequest) => requests.run(request.requestId, signal => browserApi<T>(bootstrap, request, signal)),
+    cancelApi: (requestId: string) => requests.cancel(requestId),
+    dispose: () => requests.dispose()
+  }
+}
+
+export async function browserApi<T>(bootstrap: BrowserBootstrap, request: HermesApiRequest, signal?: AbortSignal): Promise<T> {
   const headers = new Headers()
   let body: BodyInit | undefined
 
@@ -204,7 +215,7 @@ export async function browserApi<T>(bootstrap: BrowserBootstrap, request: Hermes
     path: request.path,
     profile: request.profile,
     timeoutMs: request.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  })
+  }, signal)
 
   if (!response.ok) {
     throw new Error(`${response.status}: ${text || response.statusText}`)

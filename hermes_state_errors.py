@@ -70,6 +70,16 @@ def is_transient_sqlite_error(exc: BaseException) -> bool:
     )
 
 
+def is_search_execution_error(exc: BaseException) -> bool:
+    """Cancellation/storage contention is not an FTS syntax miss or an empty search."""
+    return isinstance(exc, sqlite3.Error) and (
+        _sqlite_primary_code(exc) in (sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY,
+                                     sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_IOERR,
+                                     sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB)
+        or is_transient_sqlite_error(exc) or is_malformed_db_error(exc)
+        or is_fts_scoped_corruption_error(exc))
+
+
 def is_malformed_schema_error(exc: BaseException) -> bool:
     """Only SQLite's explicit malformed-schema text: a generic "disk image is
     malformed" may be any B-tree page, so runtime repair must fail closed on it."""

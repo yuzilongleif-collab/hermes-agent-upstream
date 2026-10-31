@@ -340,6 +340,16 @@ describe('session reads pin the owner connection (#125372)', () => {
 })
 
 describe('searchSessions profile scope', () => {
+  it('passes the optional abort signal without changing query/profile routing', async () => {
+    const controller = new AbortController()
+    hermesApi.mockResolvedValue({ results: [] } as never)
+    vi.mocked(client.profileScoped).mockReturnValue({ profile: 'research' })
+    await searchSessions('中文 & query', 'research', { signal: controller.signal })
+    expect(hermesApi.mock.calls[0]).toEqual([
+      { path: `/api/sessions/search?q=${encodeURIComponent('中文 & query')}&profile=research`, profile: 'research' },
+      { signal: controller.signal }
+    ])
+  })
   it('searches the given profile instead of the primary backend', async () => {
     // Unscoped, the primary searched its launch profile while the sidebar showed another.
     hermesApi.mockResolvedValue({ results: [] } as never)
