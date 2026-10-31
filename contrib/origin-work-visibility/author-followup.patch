@@ -1,0 +1,1102 @@
+diff --git a/apps/desktop/DESIGN.md b/apps/desktop/DESIGN.md
+index 58038bdd9511a0cd1f1a9e22686b8d86fc81859f..a0bc190624b350be103563f9f98347b596a002b3 100644
+--- a/apps/desktop/DESIGN.md
++++ b/apps/desktop/DESIGN.md
+@@ -139,6 +139,10 @@ REST reaches that owner right now): `sessionRow.*` (a small badge in the row) an
+ - Only an execution claim backed by fresh evidence reads as running. A reservation, missing
+   evidence, stale evidence, a queue/dependency wait, a request for input, and review are each
+   their own state; "can't tell" is never painted as idle or healthy.
++- Confirmed background work can name the current run's role from the backend's optional
++  `current_executor`, never the planned assignee or a model brand. A review phase requires native
++  current-run review provenance, not a profile-name guess. Missing role metadata says unknown;
++  role/phase metadata never promotes reserved, stale or finished work into active execution.
+ - **Empty and unavailable differ.** No linked work paints nothing. A failed lookup, a
+   conversation the answering profile doesn't know, a ref the source can't confirm, and a
+   truncated answer are said out loud in the strip, and a row never goes quiet on a partial answer
+diff --git a/apps/desktop/src/app/chat/composer/index.tsx b/apps/desktop/src/app/chat/composer/index.tsx
+index 7cdf43dc1414e0c06605e21fa016733780943e7e..b4559faf440da326130c50f7f51c20ac9bae4139 100644
+--- a/apps/desktop/src/app/chat/composer/index.tsx
++++ b/apps/desktop/src/app/chat/composer/index.tsx
+@@ -99,7 +99,7 @@ import {
+   RICH_INPUT_SLOT
+ } from './rich-editor'
+ import { useComposerScope, useComposerSurfaceId } from './scope'
+-import { ComposerSessionSlot } from './session-slot'
++import { ComposerSessionFeedback } from './session-slot'
+ import { ComposerStatusStack } from './status-stack'
+ import { CodingStatusRow } from './status-stack/coding-row'
+ import { StatusDrawerContent, StatusDrawerToggle } from './status-stack/drawer'
+@@ -1317,12 +1317,11 @@ export function ChatBar({
+             />
+             <OnboardingSkip sessionId={statusSessionId} />
+           </div>
+-          <ComposerSessionSlot sessionId={statusSessionId} />
+           {/* Session-scoped status stack (todos, subagents, background tasks,
+               queue). An in-flow dock child: the dock is bottom-anchored, so it
+               grows upward over the thread and the dock's own measurement covers
+               it. Collapses to nothing when every status is empty. */}
+-          <StatusDrawerContent collapsed={statusDrawerCollapsed} id={statusDrawerId}>
++          <ComposerSessionFeedback collapsed={statusDrawerCollapsed} id={statusDrawerId} sessionId={statusSessionId}>
+             <ComposerStatusStack
+               onSubmit={onSubmit}
+               queue={renderComposerQueueSlot({
+@@ -1342,7 +1341,7 @@ export function ChatBar({
+               })}
+               sessionId={statusSessionId}
+             />
+-          </StatusDrawerContent>
++          </ComposerSessionFeedback>
+           <ComposerPrimitive.Root
+             className={cn(
+               'group/composer relative w-full overflow-visible rounded-2xl',
+diff --git a/apps/desktop/src/app/chat/composer/session-slot.test.tsx b/apps/desktop/src/app/chat/composer/session-slot.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ee638ae6fb2857c70b282397dbd0f93e72ab17a
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/session-slot.test.tsx
+@@ -0,0 +1,40 @@
++
++import { render, screen } from '@testing-library/react'
++import { describe, expect, it, vi } from 'vitest'
++
++vi.mock('@/contrib', () => ({
++  useContributions: () => [{ id: 'linked-work', data: { render: () => <span>Linked durable work</span> } }]
++}))
++vi.mock('@/store/session', async () => ({ $sessions: (await import('nanostores')).atom([]) }))
++vi.mock('@/store/session-states', async () => ({ $sessionStates: (await import('nanostores')).atom({}) }))
++vi.mock('@/store/session-route-context', async () => ({
++  $activeRoute: (await import('nanostores')).atom({}),
++  runtimeRouteContext: () => ({ ambient: true, connectionId: '', profile: 'default', sessionId: 'fixture', lineageIds: ['fixture'] })
++}))
++
++import { ComposerSessionFeedback } from './session-slot'
++
++describe('composer session feedback', () => {
++  it('keeps durable work outside the collapsed foreground drawer and preserves its mounted child', () => {
++    const { rerender } = render(
++      <ComposerSessionFeedback collapsed id="foreground-status" sessionId="fixture">
++        <button type="button">Foreground status</button>
++      </ComposerSessionFeedback>
++    )
++
++    const linked = screen.getByText('Linked durable work')
++    const foreground = screen.getByRole('button', { hidden: true, name: 'Foreground status' })
++    expect(linked.closest('[inert]')).toBeNull()
++    expect(foreground.closest('[inert]')?.id).toBe('foreground-status')
++
++    rerender(
++      <ComposerSessionFeedback collapsed={false} id="foreground-status" sessionId="fixture">
++        <button type="button">Foreground status</button>
++      </ComposerSessionFeedback>
++    )
++
++    expect(screen.getByText('Linked durable work')).toBe(linked)
++    expect(screen.getByRole('button', { name: 'Foreground status' })).toBe(foreground)
++    expect(foreground.closest('[inert]')).toBeNull()
++  })
++})
+diff --git a/apps/desktop/src/app/chat/composer/session-slot.tsx b/apps/desktop/src/app/chat/composer/session-slot.tsx
+index 85eabc71ffeb0aecde6c467e51fa264b7415336f..dc0291d18dc879642de772590fc7fa55d6c6567d 100644
+--- a/apps/desktop/src/app/chat/composer/session-slot.tsx
++++ b/apps/desktop/src/app/chat/composer/session-slot.tsx
+@@ -1,5 +1,5 @@
+ import { useStore } from '@nanostores/react'
+-import type { FC, ReactNode } from 'react'
++import type { ComponentProps, FC, ReactNode } from 'react'
+ import { useMemo } from 'react'
+ 
+ import { composerFloatingStrip } from '@/components/chat/composer-dock'
+@@ -13,6 +13,7 @@ import { $activeRoute, runtimeRouteContext } from '@/store/session-route-context
+ import { $sessionStates } from '@/store/session-states'
+ 
+ import { COMPOSER_AREAS } from './contrib'
++import { StatusDrawerContent } from './status-stack/drawer'
+ 
+ /** Payload of a `composer.session` data contribution — a strip above the
+  *  status stack that describes THIS composer's conversation (linked work,
+@@ -74,3 +75,17 @@ export const ComposerSessionSlot: FC<{ sessionId: null | string }> = ({ sessionI
+     </div>
+   )
+ }
++
++/** Linked durable work stays above the collapsible foreground-status drawer. */
++export function ComposerSessionFeedback({
++  sessionId,
++  children,
++  ...drawer
++}: ComponentProps<typeof StatusDrawerContent> & { sessionId: null | string }) {
++  return (
++    <>
++      <ComposerSessionSlot sessionId={sessionId} />
++      <StatusDrawerContent {...drawer}>{children}</StatusDrawerContent>
++    </>
++  )
++}
+diff --git a/apps/desktop/src/plugins/kanban/__fixtures__/current-executor.json b/apps/desktop/src/plugins/kanban/__fixtures__/current-executor.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e2769b9e61554138158ce48a72dd869e5d6ce4d
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/__fixtures__/current-executor.json
+@@ -0,0 +1,389 @@
++{
++  "fixture": "synthetic Home/SQLite; native producer functions + FastAPI TestClient REST, not dispatcher or live network",
++  "origin_sha256": "38fb88e6e1d6a2ec406238f3150e5850ec78f86f09ef61702a79c359c9af0ae1",
++  "samples": [
++    {
++      "scenario": "execution-differs-from-planned-assignee",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": {
++                "profile": "worker",
++                "display_name": "Backend engineer",
++                "phase": "execution"
++              },
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "planned",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": 1793477677,
++              "current_run_id": 1,
++              "activity": "background",
++              "activity_evidence": "heartbeat"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "review-waiting",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": null,
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "review",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": null,
++              "current_run_id": null,
++              "activity": "review",
++              "activity_evidence": "status"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "review-claimed-reserved",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": null,
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": 1793477678,
++              "current_run_id": 2,
++              "activity": "reserved",
++              "activity_evidence": "claim"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "review-running",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": {
++                "profile": "reviewer",
++                "display_name": "Test engineer",
++                "phase": "review"
++              },
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": 1793477678,
++              "current_run_id": 2,
++              "activity": "background",
++              "activity_evidence": "heartbeat"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "review-stale",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": null,
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793472278,
++              "claim_expires": 1793477678,
++              "current_run_id": 2,
++              "activity": "stale",
++              "activity_evidence": "heartbeat_old"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "completed",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": null,
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "done",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": 1793476778,
++              "last_heartbeat_at": 1793472278,
++              "claim_expires": null,
++              "current_run_id": null,
++              "activity": "done",
++              "activity_evidence": "status"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "replacement-execution-old-review-retained",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": {
++                "profile": "reviewer",
++                "display_name": "Test engineer",
++                "phase": "execution"
++              },
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": 1793477678,
++              "current_run_id": 3,
++              "activity": "background",
++              "activity_evidence": "heartbeat"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "current-run-profile-metadata-missing",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": {
++                "profile": "reviewer",
++                "display_name": null,
++                "phase": "execution"
++              },
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": 1793477678,
++              "current_run_id": 3,
++              "activity": "background",
++              "activity_evidence": "heartbeat"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "store-unavailable",
++      "http_status": 500,
++      "response": {
++        "detail": "failed to read origin tasks: file is not a database"
++      }
++    }
++  ]
++}
+diff --git a/apps/desktop/src/plugins/kanban/i18n.ts b/apps/desktop/src/plugins/kanban/i18n.ts
+index 857f8b6dd3fc605e1b659b055f51d377d2baf245..dbe9743df3f713c3f192bb73cb5a37e7fd14d9a5 100644
+--- a/apps/desktop/src/plugins/kanban/i18n.ts
++++ b/apps/desktop/src/plugins/kanban/i18n.ts
+@@ -226,6 +226,8 @@ type KanbanMessages = {
+   origin: {
+     title: string
+     summary: (tasks: number) => string
++    executorUnknown: string
++    reviewing: string
+     /** What each activity means. `background` is the only execution claim. */
+     state: Record<
+       | 'archived'
+@@ -484,6 +486,8 @@ export const en: KanbanMessages = {
+   origin: {
+     title: 'Kanban',
+     summary: (tasks: number) => (tasks === 1 ? '1 linked task' : `${tasks} linked tasks`),
++    executorUnknown: 'Executor unknown',
++    reviewing: 'Reviewing',
+     state: {
+       background: 'Running in the background',
+       reserved: 'Claimed by a worker — not confirmed running',
+@@ -743,6 +747,8 @@ const ja: KanbanMessages = {
+   origin: {
+     title: 'カンバン',
+     summary: (tasks: number) => `リンク済みタスク ${tasks} 件`,
++    executorUnknown: '実行担当者不明',
++    reviewing: 'レビュー実行中',
+     state: {
+       background: 'バックグラウンドで実行中',
+       reserved: 'ワーカーが確保済み — 実行中かは未確認',
+@@ -999,6 +1005,8 @@ const zh: KanbanMessages = {
+   origin: {
+     title: '看板',
+     summary: (tasks: number) => `${tasks} 个关联任务`,
++    executorUnknown: '执行岗位未知',
++    reviewing: '复核进行中',
+     state: {
+       background: '正在后台运行',
+       reserved: '已被工作单元领取 — 尚未确认在运行',
+@@ -1255,6 +1263,8 @@ const zhHant: KanbanMessages = {
+   origin: {
+     title: '看板',
+     summary: (tasks: number) => `${tasks} 個關聯任務`,
++    executorUnknown: '執行崗位未知',
++    reviewing: '複核進行中',
+     state: {
+       background: '正在背景執行',
+       reserved: '已被工作單元領取 — 尚未確認在執行',
+diff --git a/apps/desktop/src/plugins/kanban/origin-links.test.tsx b/apps/desktop/src/plugins/kanban/origin-links.test.tsx
+index 3630181ef3afc4e7c87c7e6239c195b09acef6d0..33039893331d8857379434b80aa7443f7a88f49f 100644
+--- a/apps/desktop/src/plugins/kanban/origin-links.test.tsx
++++ b/apps/desktop/src/plugins/kanban/origin-links.test.tsx
+@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ // eslint-disable-next-line no-restricted-imports
+ import { registerPluginLocales } from '@/i18n/plugin-i18n'
+ 
++import producerFixture from './__fixtures__/current-executor.json'
+ import { bindApi, fetchOriginTasks } from './api'
+ import { en, KANBAN_LOCALES } from './i18n'
+ import {
+@@ -303,6 +304,118 @@ describe('per-conversation, route-scoped lookup', () => {
+ })
+ 
+ describe('conversation surfaces', () => {
++  it('consumes native producer REST responses through review claim and replacement, preserving failed reads', async () => {
++    // Captured from native create/claim/review/heartbeat functions and the real FastAPI router in a
++    // disposable synthetic Home. Responses are unchanged; no live dispatcher or account is implied.
++    const samples = producerFixture.samples
++    let index = 0
++
++    reply = path => {
++      if (!path.startsWith('/origin-tasks')) {
++        return answer()
++      }
++
++      const sample = samples[index]
++
++      if (sample.http_status !== 200) {
++        throw new Error('Synthetic source unavailable')
++      }
++
++      return sample.response
++    }
++
++    const ctx = context({ lineageIds: ['synthetic-origin'], sessionId: 'synthetic-origin' })
++    const { container } = render(<><OriginStrip context={ctx} /><OriginRowBadge context={ctx} /></>, { wrapper })
++    await screen.findByText(/Backend engineer · Running in the background/)
++    fireEvent.click(screen.getByRole('button', { name: en.origin.expand }))
++
++    const expected = [
++      ['background', 'Backend engineer · Running in the background'],
++      ['review', en.origin.state.review],
++      ['reserved', en.origin.state.reserved],
++      ['background', 'Test engineer · Reviewing'],
++      ['stale', en.origin.state.stale],
++      ['done', en.origin.state.done],
++      ['background', 'Test engineer · Running in the background'],
++      ['background', 'Executor unknown · Running in the background']
++    ]
++
++    for (const [position, [state, label]] of expected.entries()) {
++      index = position
++      await client.invalidateQueries()
++      await waitFor(() => {
++        const row = container.querySelector('[data-kanban-origin-ref]')
++
++        expect(row?.getAttribute('data-kanban-origin-state')).toBe(state)
++        expect(row?.textContent).toContain(label)
++      })
++
++      const badge = container.querySelector('[data-kanban-origin]')
++
++      expect(badge?.getAttribute('aria-label') ?? null).toBe(state === 'done' ? null : label)
++      expect(container.textContent).not.toContain('planned')
++    }
++
++    index = samples.length - 1
++    await client.invalidateQueries()
++    await waitFor(() => expect(screen.getByText(en.origin.unreadable)).toBeTruthy())
++    expect(container.querySelector('[data-kanban-origin-ref]')).toBeNull()
++    expect(container.textContent).not.toContain('Test engineer')
++    expect(originCalls().every(path => askedIds(path).join() === 'synthetic-origin')).toBe(true)
++  })
++
++  it('shows the current role through review claim, execution and completion without inferring phase from a profile id', async () => {
++    const task = ref('t_transfer', 'review')
++    reply = () => answer({ refs: [structuredClone(task)] })
++    render(<OriginStrip context={context({ sessionId: 'transfer' })} />, { wrapper })
++    await screen.findByRole('button', { name: en.origin.expand })
++
++    task.task = {
++      ...task.task!, activity: 'background', activity_evidence: 'heartbeat', status: 'running',
++      current_executor: { profile: 'qualityassurance', display_name: 'Test engineer', phase: 'review' }
++    } as typeof task.task
++    await client.invalidateQueries()
++    await waitFor(() => expect(screen.getAllByText(/Test engineer · Reviewing/).length).toBeGreaterThan(0))
++    fireEvent.click(screen.getByRole('button', { name: en.origin.expand }))
++    expect(screen.getAllByText('Test engineer · Reviewing').length).toBeGreaterThan(0)
++
++    task.task = {
++      ...task.task!,
++      current_executor: { profile: 'qualityassurance', display_name: 'Test engineer', phase: 'execution' }
++    } as typeof task.task
++    await client.invalidateQueries()
++    await waitFor(() => expect(screen.getAllByText('Test engineer · Running in the background').length).toBeGreaterThan(0))
++    expect(screen.queryByText('Test engineer · Reviewing')).toBeNull()
++
++    task.task = { ...task.task!, activity: 'done', status: 'done', current_executor: null } as typeof task.task
++    await client.invalidateQueries()
++    await waitFor(() => expect(screen.queryByText('Test engineer · Running in the background')).toBeNull())
++    expect(screen.getByRole('button', { name: en.origin.openTask(task.task!.title) })).toBeTruthy()
++  })
++
++  it('does not promote a reserved, stale, unavailable or unknown executor into confirmed review work', async () => {
++    const tasks = ['reserved', 'stale', 'background', 'done'].map((state, n) => {
++      const item = ref(`t_guard${n}`, state as OriginActivity)
++      item.task = {
++        ...item.task!, assignee: 'qualityassurance',
++        current_executor: n === 2 ? null : { profile: 'qualityassurance', display_name: 'Test engineer', phase: 'review' }
++      } as typeof item.task
++
++      return item
++    })
++
++    tasks.push(ref('t_missing', 'background', { evidence: 'board_unreadable', task: null }))
++    reply = () => answer({ refs: tasks })
++    render(<OriginStrip context={context({ sessionId: 'guards' })} />, { wrapper })
++    fireEvent.click(await screen.findByRole('button', { name: en.origin.expand }))
++    expect(screen.queryByText('Test engineer · Reviewing')).toBeNull()
++    expect(screen.getByText('Executor unknown · Running in the background')).toBeTruthy()
++    expect(screen.getByText(en.origin.state.reserved)).toBeTruthy()
++    expect(screen.getByText(en.origin.state.stale)).toBeTruthy()
++    expect(screen.queryByText('qualityassurance')).toBeNull()
++    expect(originCalls().every(path => path.startsWith('/origin-tasks'))).toBe(true)
++  })
++
+   it('a claim without execution evidence is "reserved", never the running badge', async () => {
+     reply = () => answer({ refs: [ref('t_a', 'reserved')] })
+ 
+diff --git a/apps/desktop/src/plugins/kanban/origin-ui.tsx b/apps/desktop/src/plugins/kanban/origin-ui.tsx
+index 4e430ad414259b7a9e905b7b953087bc9fc2b9dd..5bc605ced9e94fc6dbc8b415e3df3da0e5e15ec0 100644
+--- a/apps/desktop/src/plugins/kanban/origin-ui.tsx
++++ b/apps/desktop/src/plugins/kanban/origin-ui.tsx
+@@ -24,8 +24,25 @@ import {
+   summarizeOrigin,
+   useOriginView
+ } from './origin-links'
++import type { OriginRef } from './types'
+ import { openLinkedTask, shortId, useKanban } from './ui'
+ 
++/** Role and review phase annotate confirmed execution; neither makes a claim
++ *  or an old heartbeat healthy. Older backends remain explicitly unknown. */
++function activityLabel(ref: OriginRef, k: ReturnType<typeof useKanban>): string {
++  const state = refState(ref)
++
++  if (state !== 'background') {
++    return k.origin.state[state]
++  }
++
++  const executor = ref.task?.current_executor
++  const role = executor?.display_name?.trim() || k.origin.executorUnknown
++  const phase = executor?.phase === 'review' ? k.origin.reviewing : k.origin.state.background
++
++  return `${role} · ${phase}`
++}
++
+ /** Glyph + token tone per state. A glyph, because the sidebar dot's circle vocabulary is core's. */
+ const STATE_META: Record<OriginState, { icon: string; tone: string }> = {
+   'needs-input': { icon: 'comment-discussion', tone: 'text-amber-500' },
+@@ -63,7 +80,8 @@ export function OriginRowBadge({ context }: { context: SessionRouteContext }) {
+     return null
+   }
+ 
+-  const label = k.origin.state[shown]
++  const single = view.refs.length === 1 ? view.refs[0] : null
++  const label = single && refState(single) === shown ? activityLabel(single, k) : k.origin.state[shown]
+ 
+   const tip = [live > 1 ? `${label} · ${k.origin.summary(live)}` : label, partial && truncationText(k, partial)]
+     .filter(Boolean)
+@@ -111,7 +129,7 @@ function OriginList({ view }: { view: ReadyView }) {
+ 
+         return (
+           <li
+-            className="flex min-w-0 items-center gap-2 text-[0.6875rem]"
++            className="flex min-w-0 flex-wrap items-center gap-2 text-[0.6875rem]"
+             data-kanban-origin-ref={ref.task_id}
+             data-kanban-origin-state={state}
+             key={`${ref.board}\0${ref.task_id}`}
+@@ -120,21 +138,21 @@ function OriginList({ view }: { view: ReadyView }) {
+             {task ? (
+               <Button
+                 aria-label={k.origin.openTask(task.title)}
+-                className="min-w-0 truncate"
++                className="min-w-0 flex-1 justify-start"
+                 onClick={() => openLinkedTask({ board: ref.board, id: ref.task_id })}
+                 size="inline"
+                 type="button"
+                 variant="text"
+               >
+-                {task.title}
++                <span className="truncate">{task.title}</span>
+               </Button>
+             ) : (
+               <span className="min-w-0 truncate text-(--ui-text-tertiary)">{shortId(ref.task_id)}</span>
+             )}
+             <span className="shrink-0 text-(--ui-text-quaternary)">{k.origin.board(ref.board)}</span>
+-            <span className="ml-auto shrink-0 text-(--ui-text-tertiary)">
++            <span className="ml-auto min-w-0 max-w-full text-(--ui-text-secondary)">
+               {task
+-                ? k.origin.state[state]
++                ? activityLabel(ref, k)
+                 : (k.origin.evidence[ref.evidence as keyof typeof k.origin.evidence] ?? k.origin.state.unavailable)}
+             </span>
+             {task && (
+@@ -213,7 +231,11 @@ export function OriginStrip({ context }: { context: SessionRouteContext }) {
+         <Codicon className={meta.tone} name={meta.icon} size="0.75rem" />
+         <span>{k.origin.title}</span>
+         <span className="text-(--ui-text-tertiary)">{k.origin.summary(view.refs.length)}</span>
+-        {state && <span className="truncate text-(--ui-text-tertiary)">· {k.origin.state[state]}</span>}
++        {state && (
++          <span className="min-w-0 truncate text-(--ui-text-tertiary)">
++            · {view.refs.length === 1 ? activityLabel(view.refs[0], k) : k.origin.state[state]}
++          </span>
++        )}
+         <Codicon className="ml-auto" name={open ? 'chevron-up' : 'chevron-down'} size="0.7rem" />
+       </Button>
+       {open && <OriginList view={view} />}
+diff --git a/apps/desktop/src/plugins/kanban/types.ts b/apps/desktop/src/plugins/kanban/types.ts
+index 9c226f22fe694ef77bc9144ccc8b4723636d454c..5f35b8d2ac5bda0cd5d509a99281bd68c47d9a79 100644
+--- a/apps/desktop/src/plugins/kanban/types.ts
++++ b/apps/desktop/src/plugins/kanban/types.ts
+@@ -247,6 +247,13 @@ export interface OriginTaskSummary {
+   current_run_id?: null | number
+   activity: OriginActivity
+   activity_evidence: string
++  /** Current open run only; the backend resolves the role in the owning home.
++   *  Optional for older backends. Never infer a review phase from `assignee`. */
++  current_executor?: null | {
++    profile: string
++    display_name: null | string
++    phase: 'execution' | 'review'
++  }
+ }
+ 
+ export interface OriginRef {
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+index 72f61f1aff8e06f9ade864e7ae5d1aee40a6a4d8..e1f51249915a74190e183f8b4eeb71ee51af6318 100644
+--- a/hermes_cli/kanban_origin.py
++++ b/hermes_cli/kanban_origin.py
+@@ -208,8 +208,10 @@ def classify_activity(
+         open_run = run is not None and run.get("ended_at") is None
+         beats = [_wall_time((run or {}).get("last_heartbeat_at"), now)] if open_run else []
+         task_beat = _wall_time(task.last_heartbeat_at, now)
+-        if open_run and started is not None and task_beat is not None and task_beat >= started:
+-            beats.append(task_beat)  # the task-level beat is only this run's if it postdates the claim
++        if open_run and started is not None and task_beat is not None and task_beat > started:
++            # Equality is ambiguous at second resolution: it can be the previous run's last beat.
++            # Real same-second heartbeats still count through the run-bound timestamp above.
++            beats.append(task_beat)
+         beat = max((b for b in beats if b is not None), default=None)
+         spawn = _wall_time(spawned_at, now) if open_run and run.get("worker_pid") else None
+         if beat is not None:
+@@ -252,8 +254,43 @@ def _open_readonly(board: str) -> tuple[Optional[sqlite3.Connection], str]:
+         return None, "board_unreadable"
+ 
+ 
+-def _task_summary(task: Any, activity: str, evidence: str) -> dict[str, Any]:
++def _executor_display_name(profile: str) -> Optional[str]:
++    """Read only this Home's exact profile metadata, never config or a roster."""
++    from hermes_cli.profiles import read_profile_meta
++    from hermes_constants import get_default_hermes_root, get_hermes_home, named_profile_is_deleted
++
++    try:
++        root = get_default_hermes_root(home=get_hermes_home()).resolve()
++        directory = root if profile == "default" else root / "profiles" / profile
++        # Neither a profile alias nor a metadata symlink may borrow another Home/profile's label.
++        if directory.resolve() != directory or (directory / "profile.yaml").resolve().parent != directory:
++            return None
++        if profile != "default" and named_profile_is_deleted(directory):
++            return None
++        return read_profile_meta(directory)["display_name"] or None
++    except (OSError, ValueError):
++        return None
++
++
++def _current_executor(conn: sqlite3.Connection, task: Any, run: Optional[dict], activity: str) -> Optional[dict]:
++    from hermes_cli import kanban_db as kb
++    from hermes_constants import PROFILE_ID_RE
++
++    if (activity != "background" or not run or run.get("ended_at") is not None
++            or run.get("status") != "running" or run.get("outcome") is not None):
++        return None
++    profile = run.get("profile")
++    if not isinstance(profile, str) or not PROFILE_ID_RE.fullmatch(profile):
++        return None
++    # The native retry classifier reads ONLY this run's claimed.source_status, including
++    # claim_review_task's review -> running transition. Old reviews and role names cannot vote.
++    phase = "review" if kb._retry_status_for_run(conn, task.id, task.current_run_id) == "review" else "execution"
++    return {"profile": profile, "display_name": _executor_display_name(profile), "phase": phase}
++
++
++def _task_summary(task: Any, activity: str, evidence: str, executor: Optional[dict]) -> dict[str, Any]:
+     return {
++        "current_executor": executor,
+         "id": task.id, "title": task.title, "status": task.status, "assignee": task.assignee,
+         "block_kind": task.block_kind, "created_at": task.created_at, "completed_at": task.completed_at,
+         "last_heartbeat_at": task.last_heartbeat_at, "claim_expires": task.claim_expires,
+@@ -283,8 +320,9 @@ def _read_ref(
+     run, spawned_at = None, None
+     if task.current_run_id:
+         found = conn.execute(
+-            "SELECT worker_pid, started_at, last_heartbeat_at, ended_at FROM task_runs WHERE id = ?",
+-            (task.current_run_id,)).fetchone()
++            "SELECT profile, status, outcome, worker_pid, started_at, last_heartbeat_at, ended_at "
++            "FROM task_runs WHERE id = ? AND task_id = ?",
++            (task.current_run_id, task.id)).fetchone()
+         run = dict(found) if found else None
+         if run:
+             spawned_at = conn.execute(
+@@ -293,7 +331,8 @@ def _read_ref(
+     open_parents = conn.execute(
+         "SELECT COUNT(*) FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+         "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived')", (task_id,)).fetchone()[0]
+-    return "ok", _task_summary(task, *classify_activity(task, run, spawned_at, int(open_parents), now, claim_window))
++    activity, evidence = classify_activity(task, run, spawned_at, int(open_parents), now, claim_window)
++    return "ok", _task_summary(task, activity, evidence, _current_executor(conn, task, run, activity))
+ 
+ 
+ def origin_tasks(session_ids: Iterable[str], *, now: Optional[int] = None) -> dict[str, Any]:
+diff --git a/tests/hermes_cli/test_kanban_origin.py b/tests/hermes_cli/test_kanban_origin.py
+index 494b7f47c4480b629731168c573584e848c365b8..8c2bd4d45a7f2ae2cd2f9f3181ee7ee60d5bb385 100644
+--- a/tests/hermes_cli/test_kanban_origin.py
++++ b/tests/hermes_cli/test_kanban_origin.py
+@@ -141,8 +141,39 @@ def test_a_tip_only_request_exposes_only_its_own_resolved_chain(homes):
+     assert other_profile["refs"] == []
+ 
+ 
++def test_executor_label_is_bound_to_the_active_home_not_launch_home(homes, tmp_path):
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    first, _ = homes
++    second = tmp_path / "second-home"
++    second.mkdir()
++    tasks = []
++    for home, label in ((first, "First engineer"), (second, "Second engineer")):
++        directory = home / "profiles" / "worker"
++        directory.mkdir(parents=True)
++        (directory / "profile.yaml").write_text(f"display_name: {label}\n", encoding="utf-8")
++        seed_sessions(home, "same-origin")
++
++        def setup():
++            with scoped_current_session_id("same-origin"):
++                task = create(assignee="worker")
++            with kbc.connect_closing() as conn:
++                assert kb.claim_task(conn, task) is not None
++                kbd.heartbeat_worker(conn, task)
++            return task
++
++        tasks.append(in_profile(home, setup))
++
++    for home, task, label in ((first, tasks[0], "First engineer"), (second, tasks[1], "Second engineer"),
++                              (first, tasks[0], "First engineer")):
++        result = in_profile(home, lambda: origin_tasks(["same-origin"]))
++        assert [r["task_id"] for r in result["refs"]] == [task]
++        assert result["refs"][0]["task"]["current_executor"] == {
++            "profile": "worker", "display_name": label, "phase": "execution"}
++
++
+ def test_a_read_never_creates_a_profiles_store(homes):
+-    default, named = homes  # profile b exists but has never held a session
++    _default, named = homes  # profile b exists but has never held a session
+ 
+     result = in_profile(named, lambda: origin_tasks(["anything"]))
+ 
+diff --git a/tests/plugins/test_kanban_origin_tasks.py b/tests/plugins/test_kanban_origin_tasks.py
+index 549334b3cd28231a2495012734f46d2cfda0cbbb..c3630ad59fec73c38b15d845f8179b235d379d27 100644
+--- a/tests/plugins/test_kanban_origin_tasks.py
++++ b/tests/plugins/test_kanban_origin_tasks.py
+@@ -122,6 +122,153 @@ def test_activity_comes_from_the_current_runs_evidence(api):
+     assert stale[beating] == ("stale", "heartbeat_old")
+ 
+ 
++def _task(api, task_id):
++    response = api.get(URL, params={"session_ids": "origin"})
++    assert response.status_code == 200
++    return next(r["task"] for r in response.json()["refs"] if r["task_id"] == task_id)
++
++
++def _profile(home, name, label):
++    directory = home if name == "default" else home / "profiles" / name
++    directory.mkdir(parents=True, exist_ok=True)
++    (directory / "profile.yaml").write_text(f"display_name: {label}\n", encoding="utf-8")
++
++
++def test_current_executor_uses_live_run_not_planned_assignee(api, home, monkeypatch):
++    from hermes_cli import profiles
++
++    _profile(home, "worker", "Backend engineer")
++    monkeypatch.setattr(profiles, "list_profiles", lambda **_: pytest.fail("enumerated profiles"))
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++        kb.assign_task(conn, task, "worker")
++        claimed = kb.claim_task(conn, task)
++        assert claimed is not None
++        kbd.heartbeat_worker(conn, task)
++        # An operator's later assignment is a plan, not the profile of the already-open run.
++        conn.execute("UPDATE tasks SET assignee = 'planned' WHERE id = ?", (task,))
++        conn.commit()
++
++    summary = _task(api, task)
++    assert summary["assignee"] == "planned"
++    assert summary["activity"] == "background"
++    assert summary["current_executor"] == {
++        "profile": "worker", "display_name": "Backend engineer", "phase": "execution"}
++
++
++@pytest.mark.parametrize("reviewer", ["worker", "qualityassurance"])
++def test_review_claim_provenance_does_not_leak_to_a_replacement_run(api, home, reviewer, monkeypatch):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    _profile(home, reviewer, "Independent reviewer")
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++        implementer = kb.claim_task(conn, task)
++        kbd.heartbeat_worker(conn, task)  # same-second old beat must not make the next claim healthy
++        assert kb.request_review(conn, task, reviewer=reviewer, expected_run_id=implementer.current_run_id)
++    assert _task(api, task)["current_executor"] is None  # waiting for a reviewer is not executing
++    with kbc.connect_closing() as conn:
++        review = kb.claim_review_task(conn, task)
++        assert review is not None
++    reserved = _task(api, task)
++    assert reserved["activity"] == "reserved"
++    assert reserved["current_executor"] is None
++    with kbc.connect_closing() as conn:
++        kbd.heartbeat_worker(conn, task)
++    reviewing = _task(api, task)
++    assert reviewing["activity"] == "background"
++    assert reviewing["current_executor"] == {
++        "profile": reviewer, "display_name": "Independent reviewer", "phase": "review"}
++    with kbc.connect_closing() as conn:
++        assert kb.complete_task(conn, task, summary="Synthetic work completed", expected_run_id=review.current_run_id)
++        # Reopen as ordinary execution while retaining all old review events.
++        conn.execute("UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?", (task,))
++        conn.commit()
++        replacement = kb.claim_task(conn, task)
++        assert replacement.current_run_id != review.current_run_id
++        kbd.heartbeat_worker(conn, task)
++    assert _task(api, task)["current_executor"]["phase"] == "execution"
++
++
++@pytest.mark.parametrize("state", ["done", "ended", "reserved", "stale", "missing_run"])
++def test_executor_never_upgrades_unconfirmed_execution(api, state):
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++        run = kb.claim_task(conn, task)
++        assert run is not None
++        if state != "reserved":
++            kbd.heartbeat_worker(conn, task)
++        old = int(time.time()) - 5 * kb._resolve_claim_ttl_seconds()
++        mutations = {
++            "ended": [("UPDATE task_runs SET ended_at = ? WHERE id = ?", (int(time.time()), run.current_run_id))],
++            "reserved": [],
++            "stale": [
++                ("UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?", (old, run.current_run_id)),
++                ("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (old, task))],
++            "missing_run": [("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task,))],
++        }
++        if state == "done":
++            assert kb.complete_task(conn, task, summary="Synthetic work completed", expected_run_id=run.current_run_id)
++        else:
++            for sql, params in mutations[state]:
++                conn.execute(sql, params)
++        conn.commit()
++    summary = _task(api, task)
++    assert summary["current_executor"] is None
++    assert summary["activity"] != "background"
++
++
++def test_executor_cannot_borrow_another_tasks_run(api):
++    with kbc.connect_closing() as conn:
++        task, other = _linked(conn), _linked(conn)
++        assert kb.claim_task(conn, task) is not None
++        wrong = kb.claim_task(conn, other)
++        assert wrong is not None
++        kbd.heartbeat_worker(conn, other)
++        conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (wrong.current_run_id, task))
++        conn.commit()
++    summary = _task(api, task)
++    assert summary["current_executor"] is None
++    assert summary["activity"] != "background"
++
++
++@pytest.mark.parametrize("offset, activity", [(0, "reserved"), (1, "background")])
++def test_task_only_heartbeat_must_unambiguously_postdate_claim(api, monkeypatch, offset, activity):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++        assert kb.claim_task(conn, task) is not None
++        # Legacy task-only signal: equal-second may belong to the previous run; later is usable.
++        conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (now + offset, task))
++        conn.commit()
++    monkeypatch.setattr(time, "time", lambda: now + offset)
++    summary = _task(api, task)
++    assert summary["activity"] == activity
++    assert (summary["current_executor"] is not None) == (activity == "background")
++
++
++@pytest.mark.parametrize("metadata", ["missing", "malformed", "cross_home", "cross_profile"])
++def test_executor_label_never_borrows_other_profile_or_home(api, home, tmp_path, metadata):
++    _profile(home, "default", "Do not borrow origin label")
++    if metadata == "malformed":
++        _profile(home, "worker", "temporary")
++        (home / "profiles/worker/profile.yaml").write_text("[invalid yaml", encoding="utf-8")
++    elif metadata.startswith("cross_"):
++        target = tmp_path / "other-home" if metadata == "cross_home" else home / "profiles/other"
++        _profile(target, "default", "Do not borrow target label")
++        directory = home / "profiles/worker"
++        directory.mkdir(parents=True, exist_ok=True)
++        (directory / "profile.yaml").symlink_to(target / "profile.yaml")
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++        kb.assign_task(conn, task, "worker")
++        assert kb.claim_task(conn, task) is not None
++        kbd.heartbeat_worker(conn, task)
++    assert _task(api, task)["current_executor"] == {
++        "profile": "worker", "display_name": None, "phase": "execution"}
++
++
+ def test_queue_wait_and_input_states_are_distinct(api):
+     with kbc.connect_closing() as conn:
+         waiting_on = kb.create_task(conn, title="parent", assignee="default")

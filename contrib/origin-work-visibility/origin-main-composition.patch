@@ -1,0 +1,4026 @@
+diff --git a/apps/desktop/DESIGN.md b/apps/desktop/DESIGN.md
+index 675ea1052e3168f27f55613564d9de3a7dfeea20..a0bc190624b350be103563f9f98347b596a002b3 100644
+--- a/apps/desktop/DESIGN.md
++++ b/apps/desktop/DESIGN.md
+@@ -125,6 +125,33 @@ rows must not insert their full height before the outgoing stack can settle.
+ No completion callback may clear the measurement of a newly arrived card.
+ Reduced motion settles immediately without retaining empty clearance.
+ 
++## Linked work on a conversation
++
++A conversation can show the work it ordered elsewhere (Kanban tasks today) after its own turn
++has ended. Plugins add it through two generic seams that hand them the conversation's
++`SessionRouteContext` (stored id, lineage ids, owner profile, connection, and whether plugin
++REST reaches that owner right now): `sessionRow.*` (a small badge in the row) and
++`composer.session` (a strip above the status stack). Core never imports the feature.
++
++- The sidebar dot stays core's: it alone speaks for the foreground turn, subagents and
++  processes. A plugin badge is a **glyph** beside it, never a second circle, and shows only a
++  confirmed, unfinished link. Completed work is listed in the strip, never on a badge.
++- Only an execution claim backed by fresh evidence reads as running. A reservation, missing
++  evidence, stale evidence, a queue/dependency wait, a request for input, and review are each
++  their own state; "can't tell" is never painted as idle or healthy.
++- Confirmed background work can name the current run's role from the backend's optional
++  `current_executor`, never the planned assignee or a model brand. A review phase requires native
++  current-run review provenance, not a profile-name guess. Missing role metadata says unknown;
++  role/phase metadata never promotes reserved, stale or finished work into active execution.
++- **Empty and unavailable differ.** No linked work paints nothing. A failed lookup, a
++  conversation the answering profile doesn't know, a ref the source can't confirm, and a
++  truncated answer are said out loud in the strip, and a row never goes quiet on a partial answer
++  (even one with no refs). Each conversation is asked for on its own, so one conversation's cap and
++  counts never reach another. Rows whose owner plugin REST doesn't reach
++  (another profile or connection) are never queried and paint nothing.
++- The strip starts collapsed. Its actions ("open task", "worker log") are the user's; a
++  background event never navigates, opens a drawer, or moves focus.
++
+ ## Window background behavior
+ 
+ Settings → Appearance → Window layout offers **Minimize to tray**, off by default and
+diff --git a/apps/desktop/e2e/core/README.md b/apps/desktop/e2e/core/README.md
+index 886dc0cf5e3b3bc4e4d3021b19ff3e6a220e78ff..675ab592182bb9bcd416c29fd1a034f0d740840e 100644
+--- a/apps/desktop/e2e/core/README.md
++++ b/apps/desktop/e2e/core/README.md
+@@ -59,6 +59,13 @@ A small, deterministic Electron suite that guards three issue classes end to end
+   cold relaunch (#121148). `lineage-compaction-prompt.spec.ts`: a redirect
+   prompt acknowledged mid-turn whose turn then compacts; the refresh passes
+   through `preserveLocalPendingTurnMessages` (#121088).
++- **Linked Kanban work** — `origin-kanban-background.spec.ts`: no dispatcher, no task execution. The
++  fixture is written by the real producer (`kanban_create` under the origin's own session ids — a
++  compression root and tip — on two boards), then task state is set directly. The origin row's badge
++  is the loudest linked state; after the conversation's own turn ends the composer strip still lists
++  every task with a distinct state (evidence-backed background, reserved-only, needs-input, done) and
++  "worker log" opens that board's drawer on the log; a second profile holding the SAME literal
++  session id shows nothing, and the links are back when returning to the owner.
+ - **Remote topology** — `remote-topology.spec.ts`: the whole app on a remote
+   `hermes serve` (`HERMES_DESKTOP_REMOTE_URL` + token): a client-only image is
+   shipped as bytes, never as a client path (#120730, env-remote shape); remote
+diff --git a/apps/desktop/e2e/core/origin-kanban-background.spec.ts b/apps/desktop/e2e/core/origin-kanban-background.spec.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ea00cb8f40d9aecd6e7b8bfc21b596ae53fd1d0
+--- /dev/null
++++ b/apps/desktop/e2e/core/origin-kanban-background.spec.ts
+@@ -0,0 +1,327 @@
++/**
++ * Linked Kanban work follows the conversation that ordered it — real app, real
++ * `hermes serve`, only the LLM faked; no dispatcher runs and no task executes.
++ *
++ * The fixture is built by the PRODUCERS, not by hand: `kanban_create` runs under the origin's own
++ * session id (the compression ROOT for one task, the TIP for the rest) on several boards, so the
++ * origin index in state.db is exactly what the tool wrote; claims, heartbeats and the worker spawn
++ * come from `claim_task` / `heartbeat_worker` / `_set_worker_pid`. Evidence is then aged or removed
++ * (a stale spawn, a deleted task, a removed board, and a board whose kanban.db path is a directory —
++ * a storage fault no permission repair can heal) so a gap is a real gap.
++ *
++ * Lineage here is SEEDED (a compression root + tip, as `end_session(..., 'compression')` leaves
++ * them); a real in-app compaction is covered by lineage-rotation.spec.ts and is not repeated here.
++ *
++ *  - the origin row's sidebar badge reports the loudest state (needs input), with no board scan;
++ *  - after the conversation's own turn completes — and after a reload — the composer strip still
++ *    lists every linked task, each state distinct (evidence-backed background, reserved-only,
++ *    stale, needs-input, done) plus three gaps shown as gaps (task / board missing, board
++ *    unreadable), and "worker log" opens THAT task's board drawer on the log section;
++ *  - the foreground turn is independent: one prompt, one completion, no kanban text in the transcript;
++ *  - A → B → A: a profile whose store holds the same literal session id shows nothing, and the
++ *    origin's links are back on return.
++ */
++
++import { spawnSync } from 'node:child_process'
++import * as path from 'node:path'
++
++import { expect, type Page, test } from '@playwright/test'
++
++import {
++  composer,
++  type CoreSandbox,
++  coreAppEnv,
++  createCoreSandbox,
++  currentSessionId,
++  launchCoreApp,
++  recordWebSockets,
++  REPO_ROOT,
++  send,
++  waitForInteractive,
++  writeProviderHome
++} from './harness'
++import { startScriptedProvider } from './provider'
++import { messageRows, python } from './remote-helpers'
++
++const nonce = Math.random()
++  .toString(36)
++  .slice(2, 8)
++  .replace(/[^a-z0-9]/g, 'x')
++  .padEnd(4, 'q')
++
++const SEED = String.raw`
++import json, os, sys, time
++from pathlib import Path
++
++home, nonce = Path(sys.argv[1]), sys.argv[2]
++os.environ["HERMES_HOME"] = str(home)
++
++from gateway.session_context import scoped_current_session_id
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_state import SessionDB
++from tools import kanban_tools as kt
++
++root, tip = "origin-root-" + nonce, "origin-tip-" + nonce
++
++
++def sessions(path, rows):
++    db = SessionDB(db_path=path / "state.db")
++    for sid, title, parent, end in rows:
++        db.create_session(sid, source="cli", **({"parent_session_id": parent} if parent else {}))
++        db.append_message(sid, "user", "hello " + sid)
++        db.append_message(sid, "assistant", "hi " + sid)
++        db.set_session_title(sid, title)
++        if end:
++            db.end_session(sid, end)
++    db.close()
++
++
++sessions(home, [(root, "Origin conversation", None, "compression"), (tip, "Origin conversation (cont.)", root, None)])
++named = home / "profiles" / "b"
++named.mkdir(parents=True, exist_ok=True)
++(named / "config.yaml").write_text("")
++sessions(named, [(root, "Other profile same id", None, None)])  # the SAME literal id, another store
++
++kb.init_db()
++for slug in ("alpha", "gone", "broken"):
++    kb.create_board(slug)
++
++
++def create(board, title, session):
++    args = {"title": title, "assignee": "default", **({"board": board} if board else {})}
++    with scoped_current_session_id(session):
++        out = json.loads(kt._handle_create(args))
++    assert out["ok"], out
++    return out["task_id"]
++
++
++def sql(board, statement, *params):
++    with kbc.connect_closing(board=board) as conn:
++        conn.execute(statement, params)
++        conn.commit()
++
++
++def claim(board, task_id, *, beat=False, spawn=False):
++    with kbc.connect_closing(board=board) as conn:
++        assert kb.claim_task(conn, task_id) is not None  # opens a real run
++        if spawn:
++            kbd._set_worker_pid(conn, task_id, os.getpid())  # real pid + process fingerprint + event
++        if beat:
++            kbd.heartbeat_worker(conn, task_id)
++
++
++ids = {
++    "background": create("alpha", "Background job " + nonce, root),
++    "done": create("alpha", "Finished report " + nonce, tip),
++    "missing": create("alpha", "Deleted later " + nonce, tip),
++    "reserved": create(None, "Reserved only " + nonce, tip),
++    "ask": create(None, "Needs answer " + nonce, tip),
++    "stale": create(None, "Quiet worker " + nonce, tip),
++    "gone": create("gone", "Board removed " + nonce, tip),
++    "broken": create("broken", "Board unreadable " + nonce, tip),
++}
++claim("alpha", ids["background"], beat=True)
++sql("alpha", "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", int(time.time()), ids["done"])
++claim(None, ids["reserved"])
++sql(None, "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input' WHERE id = ?", ids["ask"])
++claim(None, ids["stale"], spawn=True)
++old = int(time.time()) - 5 * 3600
++sql(None, "UPDATE task_runs SET started_at = ? WHERE task_id = ?", old, ids["stale"])
++sql(None, "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'spawned'", old, ids["stale"])
++
++# Controlled evidence loss AFTER indexing: the index keeps the ref, the boards no longer confirm it.
++sql("alpha", "DELETE FROM tasks WHERE id = ?", ids["missing"])
++kb.remove_board("gone", archive=False)
++# A genuine, stable storage fault on the sandbox's own broken board: a DIRECTORY where kanban.db
++# should be. SQLite cannot open it, and neither permission tightening nor a repair path can turn it
++# back into a database. Every seeded connection is closed by now.
++broken_db = Path(kb.kanban_db_path(board="broken"))
++for suffix in ("", "-wal", "-shm"):
++    Path(str(broken_db) + suffix).unlink(missing_ok=True)
++broken_db.mkdir()
++
++log = kb.worker_log_path(ids["background"], board="alpha")
++log.parent.mkdir(parents=True, exist_ok=True)
++log.write_text("LOG-LINE-" + nonce + "\n")
++print(json.dumps(ids))
++`
++
++type Ids = Record<'ask' | 'background' | 'broken' | 'done' | 'gone' | 'missing' | 'reserved' | 'stale', string>
++
++function seed(sandbox: CoreSandbox): Ids {
++  const out = spawnSync(python(), ['-c', SEED, sandbox.hermesHome, nonce], {
++    cwd: REPO_ROOT,
++    encoding: 'utf8',
++    env: {
++      HERMES_HOME: sandbox.hermesHome,
++      HOME: sandbox.home,
++      PATH: process.env.PATH ?? '',
++      PYTHONPATH: REPO_ROOT
++    }
++  })
++
++  if (out.status !== 0) {
++    throw new Error(`fixture seeding failed:\n${out.stderr}\n${out.stdout}`)
++  }
++
++  return JSON.parse(out.stdout.trim().split('\n').pop()!)
++}
++
++const ROW = '*:has(> [data-row-actions])'
++
++const rowTitled = (page: Page, title: string) =>
++  page
++    .locator(`${ROW}:not(${ROW} *)`)
++    .filter({ visible: true })
++    .filter({ hasText: title })
++
++const originRow = (page: Page) => rowTitled(page, 'Origin conversation')
++const strip = (page: Page) => page.locator('[data-slot="kanban-origin-strip"]').filter({ visible: true })
++const rail = (page: Page) => page.locator('[data-slot="profile-rail"]')
++
++async function shot(page: Page, name: string) {
++  const file = test.info().outputPath(`${name}.png`)
++
++  await page.screenshot({ path: file })
++  await test.info().attach(name, { contentType: 'image/png', path: file })
++}
++
++/** The expanded list: every linked task, each with the state the board's own evidence supports. */
++async function expectLinkedTasks(page: Page, ids: Ids, where: string) {
++  await expect(strip(page), `${where}: one strip`).toHaveCount(1, { timeout: 60_000 })
++
++  const toggle = strip(page).getByRole('button', { name: 'Show linked tasks' })
++
++  if (await toggle.count()) {
++    await toggle.click()
++  }
++
++  const state = (id: string) => strip(page).locator(`[data-kanban-origin-ref="${id}"]`)
++
++  await expect(state(ids.background), where).toHaveAttribute('data-kanban-origin-state', 'background')
++  await expect(state(ids.reserved), where).toHaveAttribute('data-kanban-origin-state', 'reserved')
++  await expect(state(ids.stale), where).toHaveAttribute('data-kanban-origin-state', 'stale')
++  await expect(state(ids.ask), where).toHaveAttribute('data-kanban-origin-state', 'needs-input')
++  await expect(state(ids.done), where).toHaveAttribute('data-kanban-origin-state', 'done')
++
++  // Gaps stay visible as gaps — never dropped, never painted as idle or healthy, each with its own cause.
++  const gaps: [string, string][] = [
++    [ids.missing, 'Task not found'],
++    [ids.gone, 'Board not found'],
++    [ids.broken, 'Board unreadable']
++  ]
++
++  for (const [gap, cause] of gaps) {
++    await expect(state(gap), `${where}: gap ${gap}`).toHaveAttribute('data-kanban-origin-state', 'unavailable')
++    await expect(state(gap), `${where}: gap ${gap} cause`).toContainText(cause)
++  }
++}
++
++test('origin kanban: linked work follows the conversation across turn end, reload, lineage, boards and profiles', async () => {
++  const provider = await startScriptedProvider()
++  const sandbox = createCoreSandbox('origin-kanban')
++  writeProviderHome(sandbox.hermesHome, provider.url)
++  const ids = seed(sandbox)
++  // The seed creates profile b with an empty config, which the app answers with the no-provider
++  // onboarding overlay. Give b the SAME synthetic provider (fake endpoint, fake key) so it is a
++  // usable profile and "shows nothing" below is a real observation, not an overlay hiding the UI.
++  writeProviderHome(path.join(sandbox.hermesHome, 'profiles', 'b'), provider.url)
++  const { app, page } = await launchCoreApp(coreAppEnv(sandbox))
++  const ws = recordWebSockets(page)
++  const marker = `U1-${nonce}`
++
++  try {
++    await waitForInteractive(app, page)
++    // The Kanban plugin ships off; opt in the way the Plugins page does.
++    await page.evaluate(() =>
++      window.localStorage.setItem('hermes.desktop.pluginDecisions.v2', JSON.stringify({ kanban: true }))
++    )
++    await page.reload()
++    await waitForInteractive(app, page)
++
++    await test.step('the origin row carries one badge: the loudest linked state, across every board', async () => {
++      const badge = originRow(page).locator('[data-kanban-origin]')
++
++      await expect(badge).toHaveCount(1, { timeout: 60_000 })
++      await expect(badge).toHaveAttribute('data-kanban-origin', 'needs-input')
++    })
++
++    await test.step('after the conversation’s own turn ends, every linked task is still listed with its own state', async () => {
++      await originRow(page).first().click()
++      expect(await currentSessionId(page)).toContain('origin-')
++
++      provider.script(marker, [{ text: [`A1-${nonce} done`] }])
++      await send(page, `${marker} status check`, 'Enter', ws)
++      await expect
++        .poll(() => provider.completions.some(c => c.marker === marker && c.finished), { timeout: 120_000 })
++        .toBe(true)
++      await expect
++        .poll(() => page.locator('[data-slot="composer-root"] button[aria-label="Stop"]').count(), { timeout: 60_000 })
++        .toBe(0)
++      await expect(page.getByText(`A1-${nonce} done`).first()).toBeVisible()
++
++      await expectLinkedTasks(page, ids, 'after the turn')
++      await shot(page, '1-after-turn-linked-tasks')
++    })
++
++    await test.step('the foreground turn was independent of the linked work', async () => {
++      // One user prompt, one provider completion for it, and nothing Kanban in the transcript.
++      expect(ws.sent.filter(frame => frame.method === 'prompt.submit')).toHaveLength(1)
++      expect(provider.completions.filter(c => c.marker === marker)).toHaveLength(1)
++
++      const stored = messageRows(sandbox, await currentSessionId(page))
++
++      expect(stored.some(row => row.role === 'user' && row.content.includes(marker))).toBe(true)
++      expect(stored.some(row => row.role === 'assistant' && row.content.includes(`A1-${nonce}`))).toBe(true)
++      expect(stored.some(row => /Kanban t_|kanban/i.test(row.content))).toBe(false)
++    })
++
++    await test.step('a reload keeps the same links, states and gaps', async () => {
++      await page.reload()
++      await waitForInteractive(app, page)
++      await expect(originRow(page).locator('[data-kanban-origin]')).toHaveCount(1, { timeout: 60_000 })
++      await expectLinkedTasks(page, ids, 'after reload')
++    })
++
++    await test.step('"worker log" opens the task’s own board drawer on the log section', async () => {
++      await strip(page).getByRole('button', { name: `Open logs: Background job ${nonce}` }).click()
++
++      const drawer = page.getByRole('dialog')
++
++      await expect(drawer).toContainText(`Background job ${nonce}`, { timeout: 30_000 })
++      await expect(drawer).toContainText(`LOG-LINE-${nonce}`)
++      await shot(page, '2-canonical-log-drawer')
++      await page.keyboard.press('Escape')
++    })
++
++    await test.step('A → B → A: another profile holding the same literal session id shows nothing', async () => {
++      const named = rail(page).getByRole('button', { name: /^b(?: · .*)?$/ }).first()
++
++      await named.click()
++      await expect(named).toHaveAttribute('aria-pressed', 'true', { timeout: 60_000 })
++      // B must be a usable, interactive profile (no onboarding overlay) before absence means anything.
++      await waitForInteractive(app, page)
++      await rowTitled(page, 'Other profile same id').first().click()
++      await expect(page.locator('[data-slot="aui_thread-viewport"]').filter({ visible: true }).first()).toContainText(
++        `hi origin-root-${nonce}`,
++        { timeout: 60_000 }
++      )
++      await expect(composer(page)).toBeVisible()
++      await expect(page.locator('[data-kanban-origin], [data-slot="kanban-origin-strip"]')).toHaveCount(0)
++
++      // On a named profile the home pill (the rail's only home glyph) is the way back to default.
++      await rail(page).locator('button:has(.codicon-home)').first().click()
++      await waitForInteractive(app, page)
++      await expect(originRow(page).locator('[data-kanban-origin]')).toHaveCount(1, { timeout: 60_000 })
++      await originRow(page).first().click()
++      await expectLinkedTasks(page, ids, 'back on A')
++      await shot(page, '3-profile-a-returned')
++    })
++  } finally {
++    await app.close().catch(() => undefined)
++    await provider.close()
++    sandbox.cleanup()
++  }
++})
+diff --git a/apps/desktop/e2e/core/remote-helpers.ts b/apps/desktop/e2e/core/remote-helpers.ts
+index b0ae1efe20a4e6dce4f5f0842a99247aaa9b50d7..916f47f8f6cb0d3d52296cc7997ca7f21ae90aa4 100644
+--- a/apps/desktop/e2e/core/remote-helpers.ts
++++ b/apps/desktop/e2e/core/remote-helpers.ts
+@@ -31,7 +31,7 @@ export interface RemoteBackend {
+   hidden: boolean
+ }
+ 
+-function python(): string {
++export function python(): string {
+   const selected = process.env.HERMES_E2E_PYTHON
+ 
+   if (selected) {
+diff --git a/apps/desktop/src/app/chat/composer/contrib.ts b/apps/desktop/src/app/chat/composer/contrib.ts
+index 2437b0ab98278cfbadc63ffa0d34e282e6beb201..adc2b818123ac6c81f5bb8cf8d400587db26bb2a 100644
+--- a/apps/desktop/src/app/chat/composer/contrib.ts
++++ b/apps/desktop/src/app/chat/composer/contrib.ts
+@@ -13,6 +13,9 @@
+  *   data kinds (`data`):      composer.middleware    (ComposerMiddleware)
+  *                             composer.attachments   (ComposerAttachmentProvider)
+  *                             composer.microActions  (ComposerMicroActionProvider)
++ *                             composer.session       (ComposerSessionContribution —
++ *                                                     a strip describing THIS
++ *                                                     composer's conversation)
+  *                             composer.contextMenu   (ComposerContextMenuProvider)
+  *
+  * Core keeps ownership of the transcript, input, and submit engine — these
+@@ -40,6 +43,7 @@ export const COMPOSER_AREAS = {
+   microActions: 'composer.microActions',
+   atCompletions: 'composer.atCompletions',
+   modelPill: 'composer.modelPill',
++  session: 'composer.session',
+   contextMenu: 'composer.contextMenu'
+ } as const
+ 
+diff --git a/apps/desktop/src/app/chat/composer/index.tsx b/apps/desktop/src/app/chat/composer/index.tsx
+index ff92f9a73da63fd6a42130ebd86c70ade0b9b2b9..b4559faf440da326130c50f7f51c20ac9bae4139 100644
+--- a/apps/desktop/src/app/chat/composer/index.tsx
++++ b/apps/desktop/src/app/chat/composer/index.tsx
+@@ -99,6 +99,7 @@ import {
+   RICH_INPUT_SLOT
+ } from './rich-editor'
+ import { useComposerScope, useComposerSurfaceId } from './scope'
++import { ComposerSessionFeedback } from './session-slot'
+ import { ComposerStatusStack } from './status-stack'
+ import { CodingStatusRow } from './status-stack/coding-row'
+ import { StatusDrawerContent, StatusDrawerToggle } from './status-stack/drawer'
+@@ -1320,7 +1321,7 @@ export function ChatBar({
+               queue). An in-flow dock child: the dock is bottom-anchored, so it
+               grows upward over the thread and the dock's own measurement covers
+               it. Collapses to nothing when every status is empty. */}
+-          <StatusDrawerContent collapsed={statusDrawerCollapsed} id={statusDrawerId}>
++          <ComposerSessionFeedback collapsed={statusDrawerCollapsed} id={statusDrawerId} sessionId={statusSessionId}>
+             <ComposerStatusStack
+               onSubmit={onSubmit}
+               queue={renderComposerQueueSlot({
+@@ -1340,7 +1341,7 @@ export function ChatBar({
+               })}
+               sessionId={statusSessionId}
+             />
+-          </StatusDrawerContent>
++          </ComposerSessionFeedback>
+           <ComposerPrimitive.Root
+             className={cn(
+               'group/composer relative w-full overflow-visible rounded-2xl',
+diff --git a/apps/desktop/src/app/chat/composer/session-slot.test.tsx b/apps/desktop/src/app/chat/composer/session-slot.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ee638ae6fb2857c70b282397dbd0f93e72ab17a
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/session-slot.test.tsx
+@@ -0,0 +1,40 @@
++
++import { render, screen } from '@testing-library/react'
++import { describe, expect, it, vi } from 'vitest'
++
++vi.mock('@/contrib', () => ({
++  useContributions: () => [{ id: 'linked-work', data: { render: () => <span>Linked durable work</span> } }]
++}))
++vi.mock('@/store/session', async () => ({ $sessions: (await import('nanostores')).atom([]) }))
++vi.mock('@/store/session-states', async () => ({ $sessionStates: (await import('nanostores')).atom({}) }))
++vi.mock('@/store/session-route-context', async () => ({
++  $activeRoute: (await import('nanostores')).atom({}),
++  runtimeRouteContext: () => ({ ambient: true, connectionId: '', profile: 'default', sessionId: 'fixture', lineageIds: ['fixture'] })
++}))
++
++import { ComposerSessionFeedback } from './session-slot'
++
++describe('composer session feedback', () => {
++  it('keeps durable work outside the collapsed foreground drawer and preserves its mounted child', () => {
++    const { rerender } = render(
++      <ComposerSessionFeedback collapsed id="foreground-status" sessionId="fixture">
++        <button type="button">Foreground status</button>
++      </ComposerSessionFeedback>
++    )
++
++    const linked = screen.getByText('Linked durable work')
++    const foreground = screen.getByRole('button', { hidden: true, name: 'Foreground status' })
++    expect(linked.closest('[inert]')).toBeNull()
++    expect(foreground.closest('[inert]')?.id).toBe('foreground-status')
++
++    rerender(
++      <ComposerSessionFeedback collapsed={false} id="foreground-status" sessionId="fixture">
++        <button type="button">Foreground status</button>
++      </ComposerSessionFeedback>
++    )
++
++    expect(screen.getByText('Linked durable work')).toBe(linked)
++    expect(screen.getByRole('button', { name: 'Foreground status' })).toBe(foreground)
++    expect(foreground.closest('[inert]')).toBeNull()
++  })
++})
+diff --git a/apps/desktop/src/app/chat/composer/session-slot.tsx b/apps/desktop/src/app/chat/composer/session-slot.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc0291d18dc879642de772590fc7fa55d6c6567d
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/session-slot.tsx
+@@ -0,0 +1,91 @@
++import { useStore } from '@nanostores/react'
++import type { ComponentProps, FC, ReactNode } from 'react'
++import { useMemo } from 'react'
++
++import { composerFloatingStrip } from '@/components/chat/composer-dock'
++import { useContributions } from '@/contrib'
++import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
++import type { SessionRouteContext } from '@/lib/session-row-slots'
++import { useStoreSelector } from '@/lib/use-session-slice'
++import { cn } from '@/lib/utils'
++import { $sessions } from '@/store/session'
++import { $activeRoute, runtimeRouteContext } from '@/store/session-route-context'
++import { $sessionStates } from '@/store/session-states'
++
++import { COMPOSER_AREAS } from './contrib'
++import { StatusDrawerContent } from './status-stack/drawer'
++
++/** Payload of a `composer.session` data contribution — a strip above the
++ *  status stack that describes THIS composer's conversation (linked work,
++ *  provenance). `render` gets the conversation's route context, so the plugin
++ *  never resolves lineage or ownership itself; return `null` to stay out. */
++export interface ComposerSessionContribution {
++  render: (context: SessionRouteContext) => ReactNode
++}
++
++const Entry: FC<{ context: SessionRouteContext; id: string; render: ComposerSessionContribution['render'] }> = ({
++  context,
++  id,
++  render
++}) => {
++  const renderSlot = useMemo(() => () => render(context), [render, context])
++
++  return (
++    <ContribBoundary id={id} variant="chip">
++      <ContribRender render={renderSlot} />
++    </ContribBoundary>
++  )
++}
++
++/** Renders every `composer.session` contribution for the composer's session.
++ *  `sessionId` is the composer's RUNTIME id; a draft with no stored id yet has
++ *  no conversation to describe, so nothing mounts. */
++export const ComposerSessionSlot: FC<{ sessionId: null | string }> = ({ sessionId }) => {
++  const contributions = useContributions(COMPOSER_AREAS.session)
++  const sessions = useStore($sessions)
++  const active = useStore($activeRoute)
++
++  const stored = useStoreSelector($sessionStates, states =>
++    sessionId ? (states[sessionId]?.storedSessionId ?? null) : null
++  )
++
++  const context = useMemo(
++    () => runtimeRouteContext(stored, sessions, active, sessionId),
++    [stored, sessions, active, sessionId]
++  )
++
++  if (contributions.length === 0 || !context) {
++    return null
++  }
++
++  return (
++    <div className={cn(composerFloatingStrip, 'px-[5px] pb-1.5 empty:hidden')} data-slot="composer-session-strip">
++      {contributions.map(contribution => {
++        const render = (contribution.data as ComposerSessionContribution | undefined)?.render
++
++        return render ? (
++          <Entry
++            context={context}
++            id={contribution.id}
++            key={`${contribution.source ?? 'core'}:${contribution.id}`}
++            render={render}
++          />
++        ) : null
++      })}
++    </div>
++  )
++}
++
++/** Linked durable work stays above the collapsible foreground-status drawer. */
++export function ComposerSessionFeedback({
++  sessionId,
++  children,
++  ...drawer
++}: ComponentProps<typeof StatusDrawerContent> & { sessionId: null | string }) {
++  return (
++    <>
++      <ComposerSessionSlot sessionId={sessionId} />
++      <StatusDrawerContent {...drawer}>{children}</StatusDrawerContent>
++    </>
++  )
++}
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-slots.tsx b/apps/desktop/src/app/chat/sidebar/session-row-slots.tsx
+index 940d1b36d0814072e59dbcdf4bf8ab430d08471a..f86f5574ae671a37eb6d560dc7dd5a743a2ae922 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-slots.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-slots.tsx
+@@ -1,14 +1,17 @@
++import { useStore } from '@nanostores/react'
+ import type { FC } from 'react'
+ import { useMemo } from 'react'
+ 
+ import { useContributions } from '@/contrib'
+ import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
+-import { type SessionRowSlotContribution } from '@/lib/session-row-slots'
++import { type SessionRowSlotContribution, type SessionRowSlotProps } from '@/lib/session-row-slots'
++import { $activeRoute, sessionRouteContext } from '@/store/session-route-context'
++import type { SessionInfo } from '@/types/hermes'
+ 
+ /**
+- * One row-decoration slot (leading / trailing) for `sessionId`. Mounts every
+- * registration and lets each decide — it renders its decoration, or nothing at
+- * all for rows it doesn't own.
++ * One row-decoration slot (leading / trailing) for the row's session. Mounts
++ * every registration and lets each decide — it renders its decoration, or
++ * nothing at all for rows it doesn't own.
+  *
+  * Mounting all of them (rather than first-wins) keeps ownership per session:
+  * a plugin that declines a row must not suppress the one that owns it purely
+@@ -16,13 +19,13 @@ import { type SessionRowSlotContribution } from '@/lib/session-row-slots'
+  * composition, not a silent drop.
+  */
+ const SessionRowSlotEntry: FC<{
++  context: SessionRowSlotProps
+   id: string
+   render: SessionRowSlotContribution['render']
+-  sessionId: string
+-}> = ({ id, render, sessionId }) => {
++}> = ({ context, id, render }) => {
+   // Stable component identity: ContribRender mounts this AS a component, so a
+   // fresh closure per render would remount the decoration on every tick.
+-  const renderSlot = useMemo(() => () => render({ sessionId }), [render, sessionId])
++  const renderSlot = useMemo(() => () => render(context), [render, context])
+ 
+   return (
+     <ContribBoundary id={id} variant="chip">
+@@ -31,8 +34,19 @@ const SessionRowSlotEntry: FC<{
+   )
+ }
+ 
+-export const SessionRowSlot: FC<{ area: string; sessionId: string }> = ({ area, sessionId }) => {
++export const SessionRowSlot: FC<{ area: string; session: SessionInfo }> = ({ area, session }) => {
+   const contributions = useContributions(area)
++  const active = useStore($activeRoute)
++
++  // Rebuilt only when the row's identity or the active route changes, so the
++  // decoration's memoised render keeps its component identity across ticks.
++  const lineageKey = `${session.id}\0${session._lineage_root_id ?? ''}\0${(session._lineage_ids ?? []).join('\0')}`
++
++  const context = useMemo(
++    () => sessionRouteContext(session, active),
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++    [lineageKey, session.profile, session.connection_id, active]
++  )
+ 
+   if (contributions.length === 0) {
+     return null
+@@ -45,10 +59,10 @@ export const SessionRowSlot: FC<{ area: string; sessionId: string }> = ({ area,
+ 
+         return render ? (
+           <SessionRowSlotEntry
++            context={context}
+             id={contribution.id}
+             key={`${contribution.source ?? 'core'}:${contribution.id}`}
+             render={render}
+-            sessionId={sessionId}
+           />
+         ) : null
+       })}
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+index f9d00be81441fe4fc640ab318c00a25acc6f8573..401933e495d724633dafb107b22d7ac557385c5f 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+@@ -418,6 +418,45 @@ describe('SidebarSessionRow decoration slots', () => {
+     expect(screen.getByTestId('tail-deco').textContent).toBe('root-9')
+   })
+ 
++  it('hands the row its lineage, its owner and whether plugin REST reaches that owner', () => {
++    act(() => {
++      disposers.push(
++        registry.register({
++          area: SESSION_ROW_AREAS.trailing,
++          data: { render: (props: SessionRowSlotProps) => <span data-testid="route">{JSON.stringify(props)}</span> },
++          id: 'route',
++          source: 'disk'
++        })
++      )
++    })
++
++    // Another profile on another connection, mid-lineage ids included: never ambient.
++    const foreign = renderRow(
++      makeSession({
++        _lineage_ids: ['root-9', 'mid-9', 'live-9'],
++        _lineage_root_id: 'root-9',
++        connection_id: 'spark',
++        id: 'live-9',
++        profile: 'research',
++        title: 'Foreign'
++      })
++    )
++
++    const route = JSON.parse(screen.getByTestId('route').textContent ?? '{}')
++
++    expect(route).toMatchObject({ ambient: false, connectionId: 'spark', profile: 'research', sessionId: 'root-9' })
++    expect([...route.lineageIds].sort()).toEqual(['live-9', 'mid-9', 'root-9'])
++    foreign.unmount()
++
++    // The active (default) profile on the primary backend is reachable.
++    renderRow(makeSession({ id: 'row-1', title: 'Mine' }))
++    expect(JSON.parse(screen.getByTestId('route').textContent ?? '{}')).toMatchObject({
++      ambient: true,
++      connectionId: '',
++      profile: 'default'
++    })
++  })
++
+   it('renders nothing for an area with no registrations and survives an unmount', () => {
+     const { container } = renderRow(makeSession({ id: 'row-7', title: 'Plain' }))
+ 
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.tsx b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+index 292af34b51bd8a04e900fb53349f1682d7febe13..92b58d8c072f93420cb75f673740d3e0e6189e72 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+@@ -30,7 +30,6 @@ import { $sidebarRowMeta } from '@/store/layout'
+ import { normalizeProfileKey } from '@/store/profile'
+ import { $projects } from '@/store/projects'
+ import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
+-import { sessionPinId } from '@/store/session'
+ import { $sessionDotStateById, hasLiveTurn, showsRunningArc } from '@/store/session-dot-state'
+ import { $sessionListDensity } from '@/store/session-list-density'
+ import { $openStoredSessionIds } from '@/store/session-states'
+@@ -547,7 +546,7 @@ function SidebarSessionRowImpl({
+               return (
+                 <>
+                   {leadNode}
+-                  <SessionRowSlot area={SESSION_ROW_AREAS.leading} sessionId={sessionPinId(session)} />
++                  <SessionRowSlot area={SESSION_ROW_AREAS.leading} session={session} />
+                   {handoffBadge}
+                   {continuationBadge}
+                   <span className="min-w-0 flex-1 self-center">
+@@ -594,7 +593,7 @@ function SidebarSessionRowImpl({
+                       </span>
+                     )}
+                   </span>
+-                  <SessionRowSlot area={SESSION_ROW_AREAS.trailing} sessionId={sessionPinId(session)} />
++                  <SessionRowSlot area={SESSION_ROW_AREAS.trailing} session={session} />
+                 </>
+               )
+             }
+@@ -608,7 +607,7 @@ function SidebarSessionRowImpl({
+                     entire width — nothing truncates against the kebab. */}
+                 <div className="flex min-w-0 items-center gap-1.5">
+                   {leadNode}
+-                  <SessionRowSlot area={SESSION_ROW_AREAS.leading} sessionId={sessionPinId(session)} />
++                  <SessionRowSlot area={SESSION_ROW_AREAS.leading} session={session} />
+                   <span
+                     className={cn(
+                       'min-w-0 flex-1 truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+@@ -619,7 +618,7 @@ function SidebarSessionRowImpl({
+                   </span>
+                   {handoffBadge}
+                   {continuationBadge}
+-                  <SessionRowSlot area={SESSION_ROW_AREAS.trailing} sessionId={sessionPinId(session)} />
++                  <SessionRowSlot area={SESSION_ROW_AREAS.trailing} session={session} />
+                   {actionsNode}
+                 </div>
+                 {/* Title + preview: ONE grouped cell with its own tight
+diff --git a/apps/desktop/src/lib/session-row-slots.ts b/apps/desktop/src/lib/session-row-slots.ts
+index 7c1fd40173be55c8e092f5cdeaa5a54462c7ec50..5426528f33a51da39bc639850eba05f3a5794c7b 100644
+--- a/apps/desktop/src/lib/session-row-slots.ts
++++ b/apps/desktop/src/lib/session-row-slots.ts
+@@ -21,16 +21,34 @@ export const SESSION_ROW_AREAS = {
+   trailing: 'sessionRow.trailing'
+ } as const
+ 
+-/** Props handed to a session-row decoration's `render`. */
+-export interface SessionRowSlotProps {
+-  /** The STORED (durable) id of the session the row renders — the lineage root,
+-   *  not the live id. Auto-compression rotates the live id, so a plugin that
+-   *  remembers `session.id` decorates the row until the next compaction and then
+-   *  silently stops matching; the durable id is the one `host.sessions.*` and
+-   *  core's own pin/reorder address (see `sessionPinId`). */
++/** Who a conversation is, where it lives, and whether plugin REST can reach it.
++ *  Handed to every per-session decoration (sidebar rows, the composer's session
++ *  strip) so a plugin never re-derives lineage or ownership. */
++export interface SessionRouteContext {
++  /** The STORED (durable) id of the conversation — the lineage root, not the
++   *  live id. Auto-compression rotates the live id, so a plugin that remembers
++   *  `session.id` decorates the row until the next compaction and then silently
++   *  stops matching; the durable id is the one `host.sessions.*` and core's own
++   *  pin/reorder address (see `sessionPinId`). */
+   sessionId: string
++  /** Every id the conversation has answered to (live tip, root, intermediate
++   *  segments). Durable references stamped mid-lineage match through this. */
++  lineageIds: readonly string[]
++  /** Owning profile (normalized; `default` when the row carries none). */
++  profile: string
++  /** Registry connection that serves the conversation; '' for the primary
++   *  local backend. */
++  connectionId: string
++  /** True only when plugin REST (`ctx.rest`) is routed to this owner right
++   *  now — same connection AND the active gateway profile. A plugin must not
++   *  query on behalf of a conversation where this is false: the call would hit
++   *  another profile's or backend's data. */
++  ambient: boolean
+ }
+ 
++/** Props handed to a session-row decoration's `render`. */
++export type SessionRowSlotProps = SessionRouteContext
++
+ /** Payload of a `sessionRow.*` contribution's `data`. */
+ export interface SessionRowSlotContribution {
+   /** Renders the decoration, or `null` to leave the row untouched. Mounted as
+diff --git a/apps/desktop/src/plugins/kanban/__fixtures__/current-executor.json b/apps/desktop/src/plugins/kanban/__fixtures__/current-executor.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e2769b9e61554138158ce48a72dd869e5d6ce4d
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/__fixtures__/current-executor.json
+@@ -0,0 +1,389 @@
++{
++  "fixture": "synthetic Home/SQLite; native producer functions + FastAPI TestClient REST, not dispatcher or live network",
++  "origin_sha256": "38fb88e6e1d6a2ec406238f3150e5850ec78f86f09ef61702a79c359c9af0ae1",
++  "samples": [
++    {
++      "scenario": "execution-differs-from-planned-assignee",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": {
++                "profile": "worker",
++                "display_name": "Backend engineer",
++                "phase": "execution"
++              },
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "planned",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": 1793477677,
++              "current_run_id": 1,
++              "activity": "background",
++              "activity_evidence": "heartbeat"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "review-waiting",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": null,
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "review",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": null,
++              "current_run_id": null,
++              "activity": "review",
++              "activity_evidence": "status"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "review-claimed-reserved",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": null,
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": 1793477678,
++              "current_run_id": 2,
++              "activity": "reserved",
++              "activity_evidence": "claim"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "review-running",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": {
++                "profile": "reviewer",
++                "display_name": "Test engineer",
++                "phase": "review"
++              },
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": 1793477678,
++              "current_run_id": 2,
++              "activity": "background",
++              "activity_evidence": "heartbeat"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "review-stale",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": null,
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793472278,
++              "claim_expires": 1793477678,
++              "current_run_id": 2,
++              "activity": "stale",
++              "activity_evidence": "heartbeat_old"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "completed",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": null,
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "done",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": 1793476778,
++              "last_heartbeat_at": 1793472278,
++              "claim_expires": null,
++              "current_run_id": null,
++              "activity": "done",
++              "activity_evidence": "status"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "replacement-execution-old-review-retained",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": {
++                "profile": "reviewer",
++                "display_name": "Test engineer",
++                "phase": "execution"
++              },
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": 1793477678,
++              "current_run_id": 3,
++              "activity": "background",
++              "activity_evidence": "heartbeat"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "current-run-profile-metadata-missing",
++      "http_status": 200,
++      "response": {
++        "profile": "default",
++        "now": 1793476778,
++        "refs": [
++          {
++            "origin_session_id": "synthetic-origin",
++            "board": "default",
++            "task_id": "t_20bc36cc",
++            "indexed_at": 1793476777,
++            "source": "sub",
++            "evidence": "ok",
++            "task": {
++              "current_executor": {
++                "profile": "reviewer",
++                "display_name": null,
++                "phase": "execution"
++              },
++              "id": "t_20bc36cc",
++              "title": "Synthetic linked work",
++              "status": "running",
++              "assignee": "reviewer",
++              "block_kind": null,
++              "created_at": 1793476777,
++              "completed_at": null,
++              "last_heartbeat_at": 1793476778,
++              "claim_expires": 1793477678,
++              "current_run_id": 3,
++              "activity": "background",
++              "activity_evidence": "heartbeat"
++            }
++          }
++        ],
++        "unknown_sessions": [],
++        "lineage": {
++          "synthetic-origin": [
++            "synthetic-origin"
++          ]
++        },
++        "truncated": {
++          "sessions": false,
++          "lineage": false,
++          "refs": false,
++          "total_refs": 1
++        }
++      }
++    },
++    {
++      "scenario": "store-unavailable",
++      "http_status": 500,
++      "response": {
++        "detail": "failed to read origin tasks: file is not a database"
++      }
++    }
++  ]
++}
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index fdab9c789571716d5c0ea31ddac050bd896e7281..fe53140cb98bc09fc27416fe4d1f8752803aad8d 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -40,6 +40,7 @@ import type {
+   KanbanTask,
+   KanbanTaskDetail,
+   OrchestrationSettings,
++  OriginTasksResponse,
+   TaskEstimate,
+   WorkerLog
+ } from './types'
+@@ -176,6 +177,8 @@ function onEventsFrame(scope: string, slug: string, data: unknown, selectedSlug
+   void queryClient.invalidateQueries({ queryKey: boardKeyPrefix(scope) })
+   // Any event can change a board's card count — keep the switcher badge honest.
+   void queryClient.invalidateQueries({ queryKey: boardsKey(scope) })
++  // …and a linked task's activity, which conversation badges and strips read.
++  void queryClient.invalidateQueries({ queryKey: originKeyPrefix(scope) })
+ 
+   for (const taskId of new Set(events.map(event => event.task_id).filter(Boolean))) {
+     void queryClient.invalidateQueries({ queryKey: taskKey(scope, slug, taskId!) })
+@@ -226,6 +229,17 @@ export function bindApi(
+   persist($lanesByProfile, LANES_KEY, false)
+   persist($collapsedLanes, COLLAPSED_KEY, {})
+ 
++  // Origin links live on boards other than the selected one, whose socket is
++  // the only live feed — so one shared slow tick refreshes every mounted
++  // conversation badge/strip (the batcher folds them into few requests).
++  const originTick = setInterval(() => {
++    if (document.visibilityState !== 'hidden') {
++      void queryClient.invalidateQueries({ queryKey: originKeyPrefix(kanbanConnectionScope()) })
++    }
++  }, ORIGIN_REFRESH_MS)
++
++  unsubs.push(() => clearInterval(originTick))
++
+   eventCursorByBoard.clear()
+ 
+   let close: (() => void) | null = null
+@@ -379,6 +393,9 @@ export const boardKey = (scope: string, slug: string, archived: boolean) =>
+ export const taskKey = (scope: string, slug: string, id: string) => ['kanban', 'task', scope, slug, id] as const
+ export const logKey = (scope: string, slug: string, id: string) => ['kanban', 'log', scope, slug, id] as const
+ export const boardsKey = (scope: string) => ['kanban', 'boards', scope] as const
++export const originKeyPrefix = (scope: string) => ['kanban', 'origin', scope] as const
++export const originKey = (scope: string, profile: string, ids: readonly string[]) =>
++  [...originKeyPrefix(scope), profile, [...ids].sort().join(',')] as const
+ export const profilesKey = (scope: string) => ['kanban', 'profiles', scope] as const
+ export const projectsKey = (scope: string) => ['kanban', 'projects', scope] as const
+ export const orchestrationKey = (scope: string) => ['kanban', 'orchestration', scope] as const
+@@ -400,6 +417,34 @@ export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/
+ 
+ export const fetchBoards = () => call<BoardsResponse>('/boards')
+ 
++const ORIGIN_REFRESH_MS = 30_000
++
++// In-flight lookups by (connection, profile, exact conversation seed set). One backend answer
++// belongs to ONE conversation: its ref cap, `total_refs` and truncation flags are that
++// conversation's own. Distinct conversations are never merged into a shared request, so a crowded
++// one cannot crowd out, or put its counts on, a sparse one.
++const originInflight = new Map<string, Promise<OriginTasksResponse>>()
++
++/** The conversation's own `/origin-tasks` answer. Identical seed sets on the same owner route (the
++ *  sidebar row and the composer of one conversation) share one in-flight request. */
++export function fetchOriginTasks(scope: string, profile: string, ids: readonly string[]): Promise<OriginTasksResponse> {
++  const seeds = [...new Set(ids)].sort()
++  const key = `${scope}\0${profile}\0${seeds.join('\0')}`
++  const pending = originInflight.get(key)
++
++  if (pending) {
++    return pending
++  }
++
++  const request = call<OriginTasksResponse>(`/origin-tasks?session_ids=${encodeURIComponent(seeds.join(','))}`).finally(
++    () => originInflight.delete(key)
++  )
++
++  originInflight.set(key, request)
++
++  return request
++}
++
+ export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profiles')
+ 
+ /** First-class Hermes projects, for scoping a board's default workspace. */
+diff --git a/apps/desktop/src/plugins/kanban/board.tsx b/apps/desktop/src/plugins/kanban/board.tsx
+index be4c98ff4a85b0a0d662357da01ab315d92adc1b..53f07d282800aa96ec200f6a7483f2f0df61d629 100644
+--- a/apps/desktop/src/plugins/kanban/board.tsx
++++ b/apps/desktop/src/plugins/kanban/board.tsx
+@@ -89,6 +89,7 @@ import { OrchestrationPanel } from './orchestration'
+ import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
+ import {
+   $newTaskLane,
++  $requestedTask,
+   ago,
+   type ArcState,
+   arcState,
+@@ -1114,7 +1115,15 @@ export function KanbanBoardPage() {
+     refetchInterval: 60_000
+   })
+ 
+-  const [openId, setOpenId] = useState<null | string>(null)
++  const [openId, setOpenIdState] = useState<null | string>(null)
++  // Section the drawer was explicitly asked to open on; any other navigation drops it.
++  const [openSection, setOpenSection] = useState<'log' | undefined>(undefined)
++
++  const setOpenId = (id: null | string) => {
++    setOpenIdState(id)
++    setOpenSection(undefined)
++  }
++
+   const [addStatus, setAddStatus] = useState<null | string>(null)
+   const [settingsOpen, setSettingsOpen] = useState(false)
+   const [search, setSearch] = useState('')
+@@ -1137,6 +1146,22 @@ export function KanbanBoardPage() {
+     $newTaskLane.set(null)
+   }, [requestedLane])
+ 
++  // A linked-task open raised from a conversation: select the task's board
++  // (the drawer and its queries follow `$boardSlug`), open the drawer, and
++  // clear the request so a remount can't reopen it.
++  const requestedTask = useValue($requestedTask)
++
++  useEffect(() => {
++    if (!requestedTask) {
++      return
++    }
++
++    $requestedTask.set(null)
++    $boardSlug.set(requestedTask.board)
++    setOpenIdState(requestedTask.id)
++    setOpenSection(requestedTask.section)
++  }, [requestedTask])
++
+   const toggleSelect = (id: string) => {
+     setSelected(prev => {
+       const next = new Set(prev)
+@@ -1447,7 +1472,13 @@ export function KanbanBoardPage() {
+       )}
+ 
+       <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
+-      <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
++      <TaskDrawer
++        columns={columnNames}
++        id={openId}
++        initialTab={openSection}
++        onClose={() => setOpenId(null)}
++        onOpen={setOpenId}
++      />
+     </div>
+   )
+ }
+diff --git a/apps/desktop/src/plugins/kanban/drawer.tsx b/apps/desktop/src/plugins/kanban/drawer.tsx
+index d5e80435158c9fd8e10729e1a60c23f01592cb4f..b94e7e4abd2d2ac5f1e7ea6828a3ab50a2215fd6 100644
+--- a/apps/desktop/src/plugins/kanban/drawer.tsx
++++ b/apps/desktop/src/plugins/kanban/drawer.tsx
+@@ -688,6 +688,7 @@ function LinkChips({
+ function FeedTabs({
+   commentPending,
+   detail,
++  initialTab,
+   log,
+   onComment,
+   onRequeue,
+@@ -695,13 +696,15 @@ function FeedTabs({
+ }: {
+   commentPending: boolean
+   detail: KanbanTaskDetail
++  /** Section the drawer opens on (an explicit "Logs" request). Applies once the section has content. */
++  initialTab?: 'log'
+   log: null | WorkerLog
+   onComment: (body: string) => void
+   onRequeue: (body: string) => void
+   running: boolean
+ }) {
+   const k = useKanban()
+-  const [tab, setTab] = useState<'activity' | 'comments' | 'log' | 'runs'>('comments')
++  const [tab, setTab] = useState<'activity' | 'comments' | 'log' | 'runs'>(initialTab ?? 'comments')
+ 
+   const hasLog = !!log?.exists && !!log.content
+   const switchable = detail.events.length > 0 || detail.runs.length > 0 || hasLog
+@@ -717,6 +720,10 @@ function FeedTabs({
+       (t.id === 'activity' ? detail.events.length > 0 : t.id === 'runs' ? detail.runs.length > 0 : hasLog)
+   )
+ 
++  // A requested section that has no content yet (the log is still loading, or
++  // the task never wrote one) shows Comments, then follows the request once it fills.
++  const active = tabs.some(t => t.id === tab) ? tab : 'comments'
++
+   const help = (
+     <Tip label={running ? k.commentsHelpRunning : k.commentsHelp}>
+       <span className="grid size-5 place-items-center rounded text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)">
+@@ -727,7 +734,7 @@ function FeedTabs({
+ 
+   const body = (
+     <div className="flex flex-col gap-4">
+-      {tab === 'comments' && (
++      {active === 'comments' && (
+         <>
+           {detail.comments.length > 0 && (
+             <ul className="flex flex-col gap-3">
+@@ -745,7 +752,7 @@ function FeedTabs({
+           <CommentComposer onRequeue={onRequeue} onSubmit={onComment} pending={commentPending} running={running} />
+         </>
+       )}
+-      {tab === 'activity' && (
++      {active === 'activity' && (
+         <ScrollFade deps={detail.events.length} max="7rem">
+           <ul className="flex flex-col gap-1">
+             {detail.events.map(event => {
+@@ -766,7 +773,7 @@ function FeedTabs({
+           </ul>
+         </ScrollFade>
+       )}
+-      {tab === 'runs' && (
++      {active === 'runs' && (
+         <ScrollFade max="11rem">
+           <ul className="flex flex-col gap-1.5">
+             {detail.runs.map(run => {
+@@ -802,7 +809,7 @@ function FeedTabs({
+           </ul>
+         </ScrollFade>
+       )}
+-      {tab === 'log' && (
++      {active === 'log' && (
+         <ScrollFade deps={log?.content.length} max="12rem">
+           <LogView className="border-0 px-0">{log!.content}</LogView>
+         </ScrollFade>
+@@ -823,7 +830,7 @@ function FeedTabs({
+   return (
+     <section className="flex flex-col gap-3">
+       <div className="flex items-center justify-between gap-2">
+-        <SegmentedControl onChange={setTab} options={tabs} value={tab} />
++        <SegmentedControl onChange={setTab} options={tabs} value={active} />
+         {help}
+       </div>
+       {body}
+@@ -834,11 +841,14 @@ function FeedTabs({
+ export function TaskDrawer({
+   columns,
+   id,
++  initialTab,
+   onClose,
+   onOpen
+ }: {
+   columns: string[]
+   id: null | string
++  /** Open on the worker-log section (an explicit "Logs" action elsewhere). */
++  initialTab?: 'log'
+   onClose: () => void
+   onOpen: (id: string) => void
+ }) {
+@@ -1092,6 +1102,7 @@ export function TaskDrawer({
+                   <FeedTabs
+                     commentPending={commentMut.isPending || requeueMut.isPending}
+                     detail={detail}
++                    initialTab={initialTab}
+                     log={log ?? null}
+                     onComment={body => commentMut.mutate(body)}
+                     onRequeue={body => requeueMut.mutate(body)}
+diff --git a/apps/desktop/src/plugins/kanban/i18n.ts b/apps/desktop/src/plugins/kanban/i18n.ts
+index 94cee91d6f22d0f635d302f68a2e30f71a2e8716..dbe9743df3f713c3f192bb73cb5a37e7fd14d9a5 100644
+--- a/apps/desktop/src/plugins/kanban/i18n.ts
++++ b/apps/desktop/src/plugins/kanban/i18n.ts
+@@ -222,6 +222,39 @@ type KanbanMessages = {
+     openKanban: string
+     artifacts: (n: number) => string
+   }
++  // Tasks a conversation ordered, shown on its sidebar row and above its composer.
++  origin: {
++    title: string
++    summary: (tasks: number) => string
++    executorUnknown: string
++    reviewing: string
++    /** What each activity means. `background` is the only execution claim. */
++    state: Record<
++      | 'archived'
++      | 'background'
++      | 'blocked'
++      | 'done'
++      | 'needs-input'
++      | 'queued'
++      | 'reserved'
++      | 'review'
++      | 'stale'
++      | 'unavailable'
++      | 'unknown'
++      | 'waiting',
++      string
++    >
++    /** Why an indexed link could not be confirmed (the task facts are withheld). */
++    evidence: Record<'board_missing' | 'board_unreadable' | 'not_associated' | 'task_missing', string>
++    unreadable: string
++    unknownHere: string
++    truncated: (shown: number, total: number) => string
++    board: (slug: string) => string
++    openTask: (title: string) => string
++    logs: (title: string) => string
++    expand: string
++    collapse: string
++  }
+ }
+ 
+ export const en: KanbanMessages = {
+@@ -449,6 +482,40 @@ export const en: KanbanMessages = {
+     timedOutTitle: 'Task took too long — Hermes will retry it automatically',
+     openKanban: 'Open Kanban',
+     artifacts: (n: number) => `${n} artifacts`
++  },
++  origin: {
++    title: 'Kanban',
++    summary: (tasks: number) => (tasks === 1 ? '1 linked task' : `${tasks} linked tasks`),
++    executorUnknown: 'Executor unknown',
++    reviewing: 'Reviewing',
++    state: {
++      background: 'Running in the background',
++      reserved: 'Claimed by a worker — not confirmed running',
++      unknown: 'No evidence a worker is running',
++      stale: 'No recent worker activity',
++      queued: 'Queued',
++      waiting: 'Waiting on other tasks',
++      'needs-input': 'Needs your input',
++      blocked: 'Blocked',
++      review: 'In review',
++      done: 'Done',
++      archived: 'Archived',
++      unavailable: 'Status unavailable'
++    },
++    evidence: {
++      board_missing: 'Board not found',
++      board_unreadable: 'Board unreadable',
++      task_missing: 'Task not found',
++      not_associated: 'No longer linked to this conversation'
++    },
++    unreadable: 'Linked task status can’t be read right now — that does not mean idle.',
++    unknownHere: 'Linked tasks can’t be listed for this conversation from here.',
++    truncated: (shown: number, total: number) => `Showing ${shown} of ${total} linked tasks`,
++    board: (slug: string) => `Board: ${slug}`,
++    openTask: (title: string) => `Open task: ${title}`,
++    logs: (title: string) => `Open logs: ${title}`,
++    expand: 'Show linked tasks',
++    collapse: 'Hide linked tasks'
+   }
+ }
+ 
+@@ -676,6 +743,40 @@ const ja: KanbanMessages = {
+     timedOutTitle: 'タスクに時間がかかりすぎました — Hermes が自動で再試行します',
+     openKanban: 'かんばんを開く',
+     artifacts: (n: number) => `成果物 ${n} 件`
++  },
++  origin: {
++    title: 'カンバン',
++    summary: (tasks: number) => `リンク済みタスク ${tasks} 件`,
++    executorUnknown: '実行担当者不明',
++    reviewing: 'レビュー実行中',
++    state: {
++      background: 'バックグラウンドで実行中',
++      reserved: 'ワーカーが確保済み — 実行中かは未確認',
++      unknown: 'ワーカーが実行中である証拠なし',
++      stale: '最近のワーカー活動なし',
++      queued: '待機中',
++      waiting: '他のタスクを待機中',
++      'needs-input': '入力が必要です',
++      blocked: 'ブロック中',
++      review: 'レビュー中',
++      done: '完了',
++      archived: 'アーカイブ済み',
++      unavailable: '状態を取得できません'
++    },
++    evidence: {
++      board_missing: 'ボードが見つかりません',
++      board_unreadable: 'ボードを読み取れません',
++      task_missing: 'タスクが見つかりません',
++      not_associated: 'この会話にはもうリンクされていません'
++    },
++    unreadable: 'リンク済みタスクの状態を現在読み取れません — アイドルという意味ではありません。',
++    unknownHere: 'この場所からはこの会話のリンク済みタスクを一覧できません。',
++    truncated: (shown: number, total: number) => `リンク済みタスク ${total} 件中 ${shown} 件を表示`,
++    board: (slug: string) => `ボード: ${slug}`,
++    openTask: (title: string) => `タスクを開く: ${title}`,
++    logs: (title: string) => `ログを開く: ${title}`,
++    expand: 'リンク済みタスクを表示',
++    collapse: 'リンク済みタスクを隠す'
+   }
+ }
+ 
+@@ -900,6 +1001,40 @@ const zh: KanbanMessages = {
+     timedOutTitle: '任务耗时过长 — Hermes 将自动重试',
+     openKanban: '打开看板',
+     artifacts: (n: number) => `${n} 个产物`
++  },
++  origin: {
++    title: '看板',
++    summary: (tasks: number) => `${tasks} 个关联任务`,
++    executorUnknown: '执行岗位未知',
++    reviewing: '复核进行中',
++    state: {
++      background: '正在后台运行',
++      reserved: '已被工作单元领取 — 尚未确认在运行',
++      unknown: '没有工作单元正在运行的证据',
++      stale: '近期没有工作单元活动',
++      queued: '排队中',
++      waiting: '等待其他任务',
++      'needs-input': '需要你的输入',
++      blocked: '受阻',
++      review: '审查中',
++      done: '已完成',
++      archived: '已归档',
++      unavailable: '状态不可用'
++    },
++    evidence: {
++      board_missing: '找不到看板',
++      board_unreadable: '无法读取看板',
++      task_missing: '找不到任务',
++      not_associated: '已不再关联到此对话'
++    },
++    unreadable: '暂时无法读取关联任务的状态 — 这并不表示空闲。',
++    unknownHere: '无法从这里列出此对话的关联任务。',
++    truncated: (shown: number, total: number) => `显示 ${total} 个关联任务中的 ${shown} 个`,
++    board: (slug: string) => `看板：${slug}`,
++    openTask: (title: string) => `打开任务：${title}`,
++    logs: (title: string) => `打开日志：${title}`,
++    expand: '显示关联任务',
++    collapse: '隐藏关联任务'
+   }
+ }
+ 
+@@ -1124,6 +1259,40 @@ const zhHant: KanbanMessages = {
+     timedOutTitle: '任務耗時過長 — Hermes 將自動重試',
+     openKanban: '開啟看板',
+     artifacts: (n: number) => `${n} 個產物`
++  },
++  origin: {
++    title: '看板',
++    summary: (tasks: number) => `${tasks} 個關聯任務`,
++    executorUnknown: '執行崗位未知',
++    reviewing: '複核進行中',
++    state: {
++      background: '正在背景執行',
++      reserved: '已被工作單元領取 — 尚未確認在執行',
++      unknown: '沒有工作單元正在執行的證據',
++      stale: '近期沒有工作單元活動',
++      queued: '排隊中',
++      waiting: '等待其他任務',
++      'needs-input': '需要你的輸入',
++      blocked: '受阻',
++      review: '審查中',
++      done: '已完成',
++      archived: '已封存',
++      unavailable: '狀態無法取得'
++    },
++    evidence: {
++      board_missing: '找不到看板',
++      board_unreadable: '無法讀取看板',
++      task_missing: '找不到任務',
++      not_associated: '已不再關聯到此對話'
++    },
++    unreadable: '暫時無法讀取關聯任務的狀態 — 這並不表示閒置。',
++    unknownHere: '無法從這裡列出此對話的關聯任務。',
++    truncated: (shown: number, total: number) => `顯示 ${total} 個關聯任務中的 ${shown} 個`,
++    board: (slug: string) => `看板：${slug}`,
++    openTask: (title: string) => `開啟任務：${title}`,
++    logs: (title: string) => `開啟日誌：${title}`,
++    expand: '顯示關聯任務',
++    collapse: '隱藏關聯任務'
+   }
+ }
+ 
+diff --git a/apps/desktop/src/plugins/kanban/origin-links.test.tsx b/apps/desktop/src/plugins/kanban/origin-links.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..33039893331d8857379434b80aa7443f7a88f49f
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/origin-links.test.tsx
+@@ -0,0 +1,491 @@
++import { host, type PluginRestOptions, type SessionRouteContext } from '@hermes/plugin-sdk'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react'
++import type { ReactNode } from 'react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// Test harness supplies the host's locale registration, as plugin loading does.
++// eslint-disable-next-line no-restricted-imports
++import { registerPluginLocales } from '@/i18n/plugin-i18n'
++
++import producerFixture from './__fixtures__/current-executor.json'
++import { bindApi, fetchOriginTasks } from './api'
++import { en, KANBAN_LOCALES } from './i18n'
++import {
++  deriveOriginView,
++  isTerminalState,
++  type OriginQueryState,
++  refState,
++  summarizeOrigin,
++  useOriginView
++} from './origin-links'
++import { OriginRowBadge, OriginStrip } from './origin-ui'
++import type { OriginActivity, OriginRef, OriginTasksResponse } from './types'
++import { $requestedTask } from './ui'
++
++vi.mock('@/hermes', () => ({ setApiRequestProfile: vi.fn() }))
++
++const ref = (
++  id: string,
++  activity: OriginActivity,
++  over: Partial<OriginRef> = {},
++  title = `Task ${id}`
++): OriginRef => ({
++  board: 'default',
++  evidence: 'ok',
++  indexed_at: 100,
++  origin_session_id: 'tip-1',
++  source: 'create',
++  task: { activity, activity_evidence: 'test', id, status: 'running', title },
++  task_id: id,
++  ...over
++})
++
++const answer = (over: Partial<OriginTasksResponse> = {}): OriginTasksResponse => ({
++  now: 1,
++  profile: 'default',
++  refs: [],
++  truncated: { lineage: false, refs: false, sessions: false, total_refs: 0 },
++  unknown_sessions: [],
++  ...over
++})
++
++const success = (data: OriginTasksResponse): OriginQueryState => ({ data, status: 'success' })
++const ids = ['root-1', 'tip-1']
++
++describe('origin view reduction', () => {
++  it('never turns a lookup it could not make into "no tasks"', () => {
++    expect(deriveOriginView(false, ids, success(answer()))).toEqual({ kind: 'out-of-scope' })
++
++    expect(deriveOriginView(true, ids, { data: undefined, status: 'error' })).toEqual({
++      kind: 'unavailable',
++      reason: 'request'
++    })
++
++    expect(deriveOriginView(true, ids, { data: undefined, status: 'pending' })).toEqual({ kind: 'loading' })
++
++    // The answering profile's store knows neither id: it is not this conversation's owner.
++    expect(deriveOriginView(true, ids, success(answer({ unknown_sessions: ids })))).toEqual({
++      kind: 'unavailable',
++      reason: 'unknown-session'
++    })
++  })
++
++  it('keeps this conversation’s lineage, orders loudest first and reports truncation', () => {
++    const other = ref('t_other', 'background', { origin_session_id: 'someone-else' })
++
++    const view = deriveOriginView(
++      true,
++      ids,
++      success(
++        answer({
++          refs: [ref('t_done', 'done'), ref('t_wait', 'waiting'), ref('t_ask', 'needs-input'), other],
++          truncated: { lineage: false, refs: true, sessions: false, total_refs: 9 }
++        })
++      )
++    )
++
++    expect(view.kind).toBe('ready')
++
++    if (view.kind === 'ready') {
++      expect(view.refs.map(r => r.task_id)).toEqual(['t_ask', 't_wait', 't_done'])
++      expect(view.truncated).toEqual({ shown: 3, total: 9 })
++    }
++  })
++
++  it('keeps a root-linked task for a route that only holds the tip after a reload', () => {
++    // After a reload the row/route carries just the live tip, but the task was ordered under the
++    // compression ROOT. The answering profile's own store resolved that lineage and says so through the
++    // canonical response field `lineage` (requested seed -> its resolved chain).
++    const response: OriginTasksResponse = {
++      ...answer({
++        refs: [
++          ref('t_root', 'background', { origin_session_id: 'root-1' }),
++          // Unrelated conversations stay out: a different id, and a root that belongs to ANOTHER seed's chain.
++          ref('t_other', 'background', { origin_session_id: 'someone-else' }),
++          ref('t_stranger', 'background', { origin_session_id: 'stranger-root' })
++        ]
++      }),
++      lineage: { 'stranger-tip': ['stranger-root', 'stranger-tip'], 'tip-1': ['root-1', 'tip-1'] }
++    }
++
++    const view = deriveOriginView(true, ['tip-1'], success(response))
++
++    expect(view.kind).toBe('ready')
++
++    if (view.kind === 'ready') {
++      expect(view.refs.map(r => r.task_id)).toEqual(['t_root'])
++      // Its nonterminal activity is counted, not lost with the dropped ref.
++      expect(summarizeOrigin(view.refs)).toEqual({ live: 1, state: 'background' })
++    }
++  })
++
++  it('trusts only the ids it sent when the answer carries no lineage metadata', () => {
++    const view = deriveOriginView(
++      true,
++      ['tip-1'],
++      success(
++        answer({
++          refs: [
++            ref('t_tip', 'queued', { origin_session_id: 'tip-1' }),
++            ref('t_root', 'queued', { origin_session_id: 'root-1' })
++          ]
++        })
++      )
++    )
++
++    expect(view.kind === 'ready' && view.refs.map(r => r.task_id)).toEqual(['t_tip'])
++  })
++
++  it('lists completed work without lighting a badge, but an unconfirmed ref does', () => {
++    const finished = [ref('t_done', 'done'), ref('t_old', 'archived')]
++    const gap = ref('t_gone', 'queued', { evidence: 'task_missing', task: null })
++
++    expect(summarizeOrigin(finished)).toEqual({ live: 0, state: 'done' })
++    expect(isTerminalState(summarizeOrigin(finished).state!)).toBe(true)
++    expect(refState(gap)).toBe('unavailable')
++    expect(summarizeOrigin([...finished, gap])).toEqual({ live: 1, state: 'unavailable' })
++  })
++})
++
++const context = (over: Partial<SessionRouteContext> = {}): SessionRouteContext => ({
++  ambient: true,
++  connectionId: '',
++  lineageIds: ids,
++  profile: 'default',
++  sessionId: 'root-1',
++  ...over
++})
++
++let client: QueryClient
++let disposeApi: () => void
++let disposeLocales: () => void
++let reply: (path: string) => unknown
++
++const rest = vi.fn(async (path: string, _options?: PluginRestOptions): Promise<unknown> => reply(path))
++
++// bindApi itself refreshes boards through the same door; only origin lookups are under test.
++const originCalls = () => rest.mock.calls.map(([path]) => path).filter(path => path.startsWith('/origin-tasks'))
++const askedIds = (path: string) => decodeURIComponent(path.split('=')[1] ?? '').split(',')
++
++const wrapper = ({ children }: { children: ReactNode }) => (
++  <QueryClientProvider client={client}>{children}</QueryClientProvider>
++)
++
++beforeEach(() => {
++  client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
++  disposeLocales = registerPluginLocales('kanban', KANBAN_LOCALES)
++  reply = () => answer()
++
++  disposeApi = bindApi(
++    async <T,>(path: string, options?: PluginRestOptions) => (await rest(path, options)) as T,
++    { get: (_key, fallback) => fallback, remove: vi.fn(), set: vi.fn() },
++    () => vi.fn()
++  )
++})
++
++afterEach(() => {
++  cleanup()
++  client.clear()
++  disposeApi()
++  disposeLocales()
++  $requestedTask.set(null)
++  vi.restoreAllMocks()
++  rest.mockClear()
++})
++
++describe('per-conversation, route-scoped lookup', () => {
++  it('shares one request for an identical seed set and never merges different conversations', async () => {
++    await Promise.all([
++      fetchOriginTasks('local', 'default', ['a-1', 'a-2']),
++      // The row and the composer of one conversation: same ids, any order.
++      fetchOriginTasks('local', 'default', ['a-2', 'a-1']),
++      fetchOriginTasks('local', 'default', ['b-1']),
++      fetchOriginTasks('local', 'other', ['a-1', 'a-2'])
++    ])
++
++    // One request per (route, conversation): a's two callers share, b and the other route are their own.
++    expect(originCalls().map(askedIds).map(group => group.join('+')).sort()).toEqual(['a-1+a-2', 'a-1+a-2', 'b-1'])
++  })
++
++  it('keeps a crowded conversation’s cap and count off a sparse one', async () => {
++    const crowded = Array.from({ length: 200 }, (_, n) => ref(`t_c${n}`, 'queued', { origin_session_id: 'crowded-1' }))
++
++    reply = path => {
++      if (!path.startsWith('/origin-tasks')) {
++        return answer()
++      }
++
++      return askedIds(path).includes('crowded-1')
++        ? answer({ refs: crowded, truncated: { lineage: false, refs: true, sessions: false, total_refs: 350 } })
++        : answer({ refs: [ref('t_s1', 'waiting', { origin_session_id: 'sparse-1' })] })
++    }
++
++    const crowdedView = renderHook(
++      () => useOriginView(context({ lineageIds: ['crowded-1'], sessionId: 'crowded-1' })),
++      { wrapper }
++    )
++
++    const sparseView = renderHook(() => useOriginView(context({ lineageIds: ['sparse-1'], sessionId: 'sparse-1' })), {
++      wrapper
++    })
++
++    await waitFor(() => expect(crowdedView.result.current.kind).toBe('ready'))
++    await waitFor(() => expect(sparseView.result.current.kind).toBe('ready'))
++
++    // The crowded conversation is capped and says so with ITS OWN total…
++    expect(crowdedView.result.current).toMatchObject({ truncated: { shown: 200, total: 350 } })
++    // …and the sparse one keeps every link, with no inherited truncation or count.
++    expect(sparseView.result.current).toMatchObject({ refs: [{ task_id: 't_s1' }], truncated: null })
++    expect(originCalls().map(askedIds)).toEqual(expect.arrayContaining([['crowded-1'], ['sparse-1']]))
++  })
++
++  it('answers each route with its own response, whatever order they resolve in', async () => {
++    let releaseSlow: () => void = () => undefined
++    const slow = new Promise<void>(resolve => (releaseSlow = resolve))
++
++    reply = path => {
++      if (!path.startsWith('/origin-tasks')) {
++        return answer()
++      }
++
++      return askedIds(path).includes('slow-1')
++        ? slow.then(() => answer({ profile: 'slow-profile', refs: [ref('t_slow', 'queued')] }))
++        : answer({ profile: 'fast-profile', refs: [ref('t_fast', 'queued')] })
++    }
++
++    const slowAnswer = fetchOriginTasks('local', 'slow-profile', ['slow-1'])
++    const fastAnswer = fetchOriginTasks('local', 'fast-profile', ['fast-1'])
++
++    // The later route settles first and carries only its own refs…
++    expect((await fastAnswer).refs.map(r => r.task_id)).toEqual(['t_fast'])
++
++    releaseSlow()
++
++    // …and the earlier one still gets its own, not the other's.
++    expect((await slowAnswer).refs.map(r => r.task_id)).toEqual(['t_slow'])
++  })
++
++  it('never queries on behalf of a conversation the plugin route does not reach', async () => {
++    const { result } = renderHook(() => useOriginView(context({ ambient: false, profile: 'other' })), { wrapper })
++
++    await new Promise(resolve => setTimeout(resolve, 60))
++
++    expect(result.current).toEqual({ kind: 'out-of-scope' })
++    expect(originCalls()).toEqual([])
++  })
++
++  it('treats a profile switch as a clean miss: nothing from the previous profile is shown', async () => {
++    reply = path =>
++      path.startsWith('/origin-tasks')
++        ? answer({ refs: [ref('t_default', 'queued', { origin_session_id: 'root-1' })] })
++        : answer()
++
++    const { rerender, result } = renderHook(({ ctx }) => useOriginView(ctx), {
++      initialProps: { ctx: context() },
++      wrapper
++    })
++
++    await waitFor(() => expect(result.current.kind).toBe('ready'))
++
++    // The user moves to another profile whose route the plugin does not reach yet…
++    rerender({ ctx: context({ ambient: false, profile: 'research' }) })
++    expect(result.current).toEqual({ kind: 'out-of-scope' })
++
++    // …and once it does, the default profile's cached answer is not painted for it.
++    reply = path =>
++      path.startsWith('/origin-tasks') ? answer({ profile: 'research', unknown_sessions: ids }) : answer()
++
++    rerender({ ctx: context({ profile: 'research' }) })
++    expect(result.current.kind).not.toBe('ready')
++
++    await waitFor(() => expect(result.current).toEqual({ kind: 'unavailable', reason: 'unknown-session' }))
++  })
++})
++
++describe('conversation surfaces', () => {
++  it('consumes native producer REST responses through review claim and replacement, preserving failed reads', async () => {
++    // Captured from native create/claim/review/heartbeat functions and the real FastAPI router in a
++    // disposable synthetic Home. Responses are unchanged; no live dispatcher or account is implied.
++    const samples = producerFixture.samples
++    let index = 0
++
++    reply = path => {
++      if (!path.startsWith('/origin-tasks')) {
++        return answer()
++      }
++
++      const sample = samples[index]
++
++      if (sample.http_status !== 200) {
++        throw new Error('Synthetic source unavailable')
++      }
++
++      return sample.response
++    }
++
++    const ctx = context({ lineageIds: ['synthetic-origin'], sessionId: 'synthetic-origin' })
++    const { container } = render(<><OriginStrip context={ctx} /><OriginRowBadge context={ctx} /></>, { wrapper })
++    await screen.findByText(/Backend engineer · Running in the background/)
++    fireEvent.click(screen.getByRole('button', { name: en.origin.expand }))
++
++    const expected = [
++      ['background', 'Backend engineer · Running in the background'],
++      ['review', en.origin.state.review],
++      ['reserved', en.origin.state.reserved],
++      ['background', 'Test engineer · Reviewing'],
++      ['stale', en.origin.state.stale],
++      ['done', en.origin.state.done],
++      ['background', 'Test engineer · Running in the background'],
++      ['background', 'Executor unknown · Running in the background']
++    ]
++
++    for (const [position, [state, label]] of expected.entries()) {
++      index = position
++      await client.invalidateQueries()
++      await waitFor(() => {
++        const row = container.querySelector('[data-kanban-origin-ref]')
++
++        expect(row?.getAttribute('data-kanban-origin-state')).toBe(state)
++        expect(row?.textContent).toContain(label)
++      })
++
++      const badge = container.querySelector('[data-kanban-origin]')
++
++      expect(badge?.getAttribute('aria-label') ?? null).toBe(state === 'done' ? null : label)
++      expect(container.textContent).not.toContain('planned')
++    }
++
++    index = samples.length - 1
++    await client.invalidateQueries()
++    await waitFor(() => expect(screen.getByText(en.origin.unreadable)).toBeTruthy())
++    expect(container.querySelector('[data-kanban-origin-ref]')).toBeNull()
++    expect(container.textContent).not.toContain('Test engineer')
++    expect(originCalls().every(path => askedIds(path).join() === 'synthetic-origin')).toBe(true)
++  })
++
++  it('shows the current role through review claim, execution and completion without inferring phase from a profile id', async () => {
++    const task = ref('t_transfer', 'review')
++    reply = () => answer({ refs: [structuredClone(task)] })
++    render(<OriginStrip context={context({ sessionId: 'transfer' })} />, { wrapper })
++    await screen.findByRole('button', { name: en.origin.expand })
++
++    task.task = {
++      ...task.task!, activity: 'background', activity_evidence: 'heartbeat', status: 'running',
++      current_executor: { profile: 'qualityassurance', display_name: 'Test engineer', phase: 'review' }
++    } as typeof task.task
++    await client.invalidateQueries()
++    await waitFor(() => expect(screen.getAllByText(/Test engineer · Reviewing/).length).toBeGreaterThan(0))
++    fireEvent.click(screen.getByRole('button', { name: en.origin.expand }))
++    expect(screen.getAllByText('Test engineer · Reviewing').length).toBeGreaterThan(0)
++
++    task.task = {
++      ...task.task!,
++      current_executor: { profile: 'qualityassurance', display_name: 'Test engineer', phase: 'execution' }
++    } as typeof task.task
++    await client.invalidateQueries()
++    await waitFor(() => expect(screen.getAllByText('Test engineer · Running in the background').length).toBeGreaterThan(0))
++    expect(screen.queryByText('Test engineer · Reviewing')).toBeNull()
++
++    task.task = { ...task.task!, activity: 'done', status: 'done', current_executor: null } as typeof task.task
++    await client.invalidateQueries()
++    await waitFor(() => expect(screen.queryByText('Test engineer · Running in the background')).toBeNull())
++    expect(screen.getByRole('button', { name: en.origin.openTask(task.task!.title) })).toBeTruthy()
++  })
++
++  it('does not promote a reserved, stale, unavailable or unknown executor into confirmed review work', async () => {
++    const tasks = ['reserved', 'stale', 'background', 'done'].map((state, n) => {
++      const item = ref(`t_guard${n}`, state as OriginActivity)
++      item.task = {
++        ...item.task!, assignee: 'qualityassurance',
++        current_executor: n === 2 ? null : { profile: 'qualityassurance', display_name: 'Test engineer', phase: 'review' }
++      } as typeof item.task
++
++      return item
++    })
++
++    tasks.push(ref('t_missing', 'background', { evidence: 'board_unreadable', task: null }))
++    reply = () => answer({ refs: tasks })
++    render(<OriginStrip context={context({ sessionId: 'guards' })} />, { wrapper })
++    fireEvent.click(await screen.findByRole('button', { name: en.origin.expand }))
++    expect(screen.queryByText('Test engineer · Reviewing')).toBeNull()
++    expect(screen.getByText('Executor unknown · Running in the background')).toBeTruthy()
++    expect(screen.getByText(en.origin.state.reserved)).toBeTruthy()
++    expect(screen.getByText(en.origin.state.stale)).toBeTruthy()
++    expect(screen.queryByText('qualityassurance')).toBeNull()
++    expect(originCalls().every(path => path.startsWith('/origin-tasks'))).toBe(true)
++  })
++
++  it('a claim without execution evidence is "reserved", never the running badge', async () => {
++    reply = () => answer({ refs: [ref('t_a', 'reserved')] })
++
++    render(<OriginRowBadge context={context()} />, { wrapper })
++
++    const badge = await screen.findByRole('status')
++
++    expect(badge.getAttribute('data-kanban-origin')).toBe('reserved')
++    expect(badge.getAttribute('aria-label')).toBe(en.origin.state.reserved)
++  })
++
++  it('keeps linked tasks reachable after they finish and opens their board log on request', async () => {
++    const navigate = vi.spyOn(host, 'navigate').mockImplementation(() => undefined)
++
++    reply = () =>
++      answer({
++        refs: [ref('t_fin', 'done', { board: 'ops' }, 'Ship the report'), ref('t_run', 'background', { board: 'ops' })]
++      })
++
++    render(<OriginStrip context={context()} />, { wrapper })
++
++    // The strip is the in-session door: it starts collapsed, finished tasks included once opened.
++    fireEvent.click(await screen.findByRole('button', { name: en.origin.expand }))
++    expect(screen.getByRole('button', { name: en.origin.openTask('Ship the report') })).toBeTruthy()
++
++    fireEvent.click(screen.getByRole('button', { name: en.origin.logs('Ship the report') }))
++    expect($requestedTask.get()).toEqual({ board: 'ops', id: 't_fin', section: 'log' })
++    expect(navigate).toHaveBeenCalledWith('/kanban')
++  })
++
++  it('says so when the lookup fails instead of painting nothing', async () => {
++    reply = path => {
++      if (path.startsWith('/origin-tasks')) {
++        throw new Error('boom')
++      }
++
++      return answer()
++    }
++
++    render(<OriginStrip context={context()} />, { wrapper })
++
++    await waitFor(() => expect(screen.getByText(en.origin.unreadable)).toBeTruthy())
++  })
++
++  it.each([
++    [
++      'a bound was hit and no count exists',
++      { lineage: true, refs: false, sessions: false, total_refs: 0 },
++      en.origin.unknownHere
++    ],
++    [
++      'a known larger total exists',
++      { lineage: false, refs: true, sessions: false, total_refs: 7 },
++      en.origin.truncated(0, 7)
++    ]
++  ])('says an incomplete answer is incomplete even with no ref returned (%s)', async (_case, truncated, words) => {
++    reply = path => (path.startsWith('/origin-tasks') ? answer({ truncated }) : answer())
++
++    const { container } = render(
++      <>
++        <OriginStrip context={context()} />
++        <OriginRowBadge context={context()} />
++      </>,
++      { wrapper }
++    )
++
++    // The strip does not vanish into "nothing linked"…
++    await waitFor(() => expect(container.querySelector('[data-kanban-origin-truncated]')?.textContent).toBe(words))
++    // …and the row does not go quiet: it carries the partial-evidence mark, never an idle look.
++    expect(container.querySelector('[data-kanban-origin]')?.getAttribute('data-kanban-origin')).toBe('unavailable')
++    expect(container.querySelector('[data-kanban-origin]')?.getAttribute('aria-label')).toContain(words)
++  })
++})
+diff --git a/apps/desktop/src/plugins/kanban/origin-links.ts b/apps/desktop/src/plugins/kanban/origin-links.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8398e35c8591388d6fd71efd77833c437c79c388
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/origin-links.ts
+@@ -0,0 +1,143 @@
++/**
++ * Origin links — what a conversation's linked Kanban tasks are doing, as the
++ * sidebar badge and the composer strip read it.
++ *
++ * Truth lives on the backend: `/origin-tasks` resolves the conversation's
++ * lineage in the owning profile and re-reads each linked board itself, deriving
++ * `activity` from the board's own rows. This module only (1) asks through the
++ * query layer — one answer per conversation, and only for conversations
++ * plugin REST actually reaches — and (2) reduces the answer to a view. Every gap stays visible as a
++ * gap: a request failure, a conversation this profile doesn't know, a ref the
++ * board could not confirm and a truncated answer are all distinct from "no tasks".
++ */
++
++import { type SessionRouteContext, useQuery } from '@hermes/plugin-sdk'
++
++import { fetchOriginTasks, originKey, routedToScope, useKanbanScope } from './api'
++import type { OriginActivity, OriginRef, OriginTasksResponse } from './types'
++
++/** What one ref (or a conversation's loudest ref) is, including "we could not tell". */
++export type OriginState = 'unavailable' | OriginActivity
++
++/** Loudest first — also the list order. */
++const RANK: Record<OriginState, number> = {
++  'needs-input': 0,
++  background: 1,
++  stale: 2,
++  unavailable: 3,
++  unknown: 4,
++  reserved: 5,
++  blocked: 6,
++  review: 7,
++  waiting: 8,
++  queued: 9,
++  done: 10,
++  archived: 11
++}
++
++/** Completed work stays listed (history, navigation) but never lights a badge. */
++export const isTerminalState = (state: OriginState): boolean => state === 'done' || state === 'archived'
++
++export const refState = (ref: OriginRef): OriginState =>
++  ref.evidence === 'ok' && ref.task ? ref.task.activity : 'unavailable'
++
++export const sortOriginRefs = (refs: readonly OriginRef[]): OriginRef[] =>
++  [...refs].sort((a, b) => RANK[refState(a)] - RANK[refState(b)] || b.indexed_at - a.indexed_at)
++
++export interface OriginSummary {
++  /** Refs that are not completed — what a badge counts. */
++  live: number
++  /** The loudest state among all refs, or null with no refs. */
++  state: null | OriginState
++}
++
++export function summarizeOrigin(refs: readonly OriginRef[]): OriginSummary {
++  let state: null | OriginState = null
++  let live = 0
++
++  for (const ref of refs) {
++    const next = refState(ref)
++
++    if (!isTerminalState(next)) {
++      live++
++    }
++
++    if (state === null || RANK[next] < RANK[state]) {
++      state = next
++    }
++  }
++
++  return { live, state }
++}
++
++export type OriginView =
++  | { kind: 'loading' }
++  | { kind: 'out-of-scope' }
++  /** `truncated` is set whenever the backend could not return this conversation's complete set (ref
++   *  cap, lineage cap or seed cap) — even with no refs at all. `total` counts this conversation only. */
++  | { kind: 'ready'; refs: OriginRef[]; truncated: null | { shown: number; total: number } }
++  | { kind: 'unavailable'; reason: 'request' | 'unknown-session' }
++
++export interface OriginQueryState {
++  data: OriginTasksResponse | undefined
++  status: 'error' | 'pending' | 'success'
++}
++
++/** Pure reduction of the batched answer to one conversation's view. */
++export function deriveOriginView(ambient: boolean, ids: readonly string[], query: OriginQueryState): OriginView {
++  if (!ambient || ids.length === 0) {
++    return { kind: 'out-of-scope' }
++  }
++
++  if (query.status === 'error') {
++    return { kind: 'unavailable', reason: 'request' }
++  }
++
++  const { data } = query
++
++  if (!data) {
++    return { kind: 'loading' }
++  }
++
++  // The answering profile's store knows none of this conversation's ids: it is not
++  // the owner, so an empty list would be a false "no tasks".
++  if (ids.every(id => data.unknown_sessions.includes(id))) {
++    return { kind: 'unavailable', reason: 'unknown-session' }
++  }
++
++  // The ids this conversation answers to: what the route holds (a lone tip after a reload) plus the chain
++  // the answering profile resolved for exactly those requested ids. Another seed's chain never joins.
++  const mine = new Set(ids)
++
++  for (const id of ids) {
++    for (const resolved of data.lineage?.[id] ?? []) {
++      mine.add(resolved)
++    }
++  }
++
++  const refs = sortOriginRefs(data.refs.filter(ref => mine.has(ref.origin_session_id)))
++  const incomplete = data.truncated.refs || data.truncated.lineage || data.truncated.sessions
++
++  return {
++    kind: 'ready',
++    refs,
++    truncated: incomplete ? { shown: refs.length, total: Math.max(data.truncated.total_refs, refs.length) } : null
++  }
++}
++
++/** One conversation's origin view. Queries only when plugin REST is routed to the
++ *  conversation's owner (`context.ambient`); the key carries the owner profile and
++ *  every lineage id, so a compression rotation or another profile is a clean miss. */
++export function useOriginView(context: SessionRouteContext): OriginView {
++  const scope = useKanbanScope()
++  const ids = context.lineageIds
++
++  const query = useQuery({
++    enabled: q => context.ambient && ids.length > 0 && routedToScope(q),
++    queryFn: () => fetchOriginTasks(scope, context.profile, ids),
++    queryKey: originKey(scope, context.profile, ids),
++    staleTime: 10_000
++  })
++
++  return deriveOriginView(context.ambient, ids, { data: query.data, status: query.status })
++}
+diff --git a/apps/desktop/src/plugins/kanban/origin-ui.tsx b/apps/desktop/src/plugins/kanban/origin-ui.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..5bc605ced9e94fc6dbc8b415e3df3da0e5e15ec0
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/origin-ui.tsx
+@@ -0,0 +1,244 @@
++/**
++ * Conversation-side Kanban surfaces: the sidebar row badge and the composer
++ * strip. Both read ONE view (`useOriginView`) and paint only what it can back.
++ *
++ *  - Badge: a small glyph beside the row's status dot (never a circle, never a
++ *    replacement for it — the dot keeps owning foreground/subagent/process
++ *    state). Shown only for a confirmed, not-yet-finished link.
++ *  - Strip: above the composer's status stack, collapsed by default. It lists
++ *    every linked task — completed ones too, for history — each with an
++ *    explicit "open task" and "worker log" action that go through the board's
++ *    own drawer. Nothing here ever opens or focuses anything by itself.
++ *
++ * Empty and unavailable are different: with no linked tasks there is nothing to
++ * paint, but a failed or unroutable lookup says so out loud — it is never idle.
++ */
++
++import { atom, Button, cn, Codicon, type SessionRouteContext, Tip, useValue } from '@hermes/plugin-sdk'
++
++import {
++  isTerminalState,
++  type OriginState,
++  type OriginView,
++  refState,
++  summarizeOrigin,
++  useOriginView
++} from './origin-links'
++import type { OriginRef } from './types'
++import { openLinkedTask, shortId, useKanban } from './ui'
++
++/** Role and review phase annotate confirmed execution; neither makes a claim
++ *  or an old heartbeat healthy. Older backends remain explicitly unknown. */
++function activityLabel(ref: OriginRef, k: ReturnType<typeof useKanban>): string {
++  const state = refState(ref)
++
++  if (state !== 'background') {
++    return k.origin.state[state]
++  }
++
++  const executor = ref.task?.current_executor
++  const role = executor?.display_name?.trim() || k.origin.executorUnknown
++  const phase = executor?.phase === 'review' ? k.origin.reviewing : k.origin.state.background
++
++  return `${role} · ${phase}`
++}
++
++/** Glyph + token tone per state. A glyph, because the sidebar dot's circle vocabulary is core's. */
++const STATE_META: Record<OriginState, { icon: string; tone: string }> = {
++  'needs-input': { icon: 'comment-discussion', tone: 'text-amber-500' },
++  background: { icon: 'server-process', tone: 'text-(--ui-accent)' },
++  stale: { icon: 'warning', tone: 'text-(--ui-text-secondary)' },
++  unavailable: { icon: 'warning', tone: 'text-(--ui-text-secondary)' },
++  unknown: { icon: 'question', tone: 'text-(--ui-text-tertiary)' },
++  reserved: { icon: 'lock', tone: 'text-(--ui-text-tertiary)' },
++  blocked: { icon: 'error', tone: 'text-(--ui-text-tertiary)' },
++  review: { icon: 'eye', tone: 'text-(--ui-text-tertiary)' },
++  waiting: { icon: 'watch', tone: 'text-(--ui-text-tertiary)' },
++  queued: { icon: 'circle-large-outline', tone: 'text-(--ui-text-tertiary)' },
++  done: { icon: 'check', tone: 'text-(--ui-text-quaternary)' },
++  archived: { icon: 'archive', tone: 'text-(--ui-text-quaternary)' }
++}
++
++export function OriginRowBadge({ context }: { context: SessionRouteContext }) {
++  const k = useKanban()
++  const view = useOriginView(context)
++
++  // Loading, unroutable and failed lookups paint nothing on a row: a row-level
++  // mark would have to claim something, and the strip is where a gap is spelled out.
++  if (view.kind !== 'ready') {
++    return null
++  }
++
++  const { live, state } = summarizeOrigin(view.refs)
++  const partial = view.truncated
++
++  // An incomplete answer is never read as idle: with nothing live in what WAS returned, the row says
++  // the evidence is partial instead of going quiet.
++  const shown: null | OriginState = partial && (!state || isTerminalState(state)) ? 'unavailable' : state
++
++  if (!shown || isTerminalState(shown)) {
++    return null
++  }
++
++  const single = view.refs.length === 1 ? view.refs[0] : null
++  const label = single && refState(single) === shown ? activityLabel(single, k) : k.origin.state[shown]
++
++  const tip = [live > 1 ? `${label} · ${k.origin.summary(live)}` : label, partial && truncationText(k, partial)]
++    .filter(Boolean)
++    .join(' · ')
++
++  const meta = STATE_META[shown]
++
++  return (
++    <Tip label={tip}>
++      <span
++        aria-label={tip}
++        className={cn('inline-flex shrink-0 items-center gap-0.5 text-[0.625rem] tabular-nums', meta.tone)}
++        data-kanban-origin={shown}
++        role="status"
++      >
++        <Codicon name={meta.icon} size="0.7rem" />
++        {live > 1 && <span>{live}</span>}
++      </span>
++    </Tip>
++  )
++}
++
++// Disclosure is per conversation and per owner; ephemeral by design.
++const $expanded = atom<Record<string, boolean>>({})
++
++type ReadyView = Extract<OriginView, { kind: 'ready' }>
++
++/** Words for an incomplete answer. A known larger total is stated; when only a bound was hit (the
++ *  lineage or seed cap) no honest count exists, so the list is said to be unavailable instead. */
++function truncationText(k: ReturnType<typeof useKanban>, truncated: NonNullable<ReadyView['truncated']>): string {
++  return truncated.total > truncated.shown
++    ? k.origin.truncated(truncated.shown, truncated.total)
++    : k.origin.unknownHere
++}
++
++function OriginList({ view }: { view: ReadyView }) {
++  const k = useKanban()
++
++  return (
++    <ul className="flex max-h-40 flex-col gap-0.5 overflow-y-auto" data-slot="kanban-origin-list">
++      {view.refs.map(ref => {
++        const state = refState(ref)
++        const meta = STATE_META[state]
++        const task = ref.evidence === 'ok' ? ref.task : null
++
++        return (
++          <li
++            className="flex min-w-0 flex-wrap items-center gap-2 text-[0.6875rem]"
++            data-kanban-origin-ref={ref.task_id}
++            data-kanban-origin-state={state}
++            key={`${ref.board}\0${ref.task_id}`}
++          >
++            <Codicon className={cn('shrink-0', meta.tone)} name={meta.icon} size="0.75rem" />
++            {task ? (
++              <Button
++                aria-label={k.origin.openTask(task.title)}
++                className="min-w-0 flex-1 justify-start"
++                onClick={() => openLinkedTask({ board: ref.board, id: ref.task_id })}
++                size="inline"
++                type="button"
++                variant="text"
++              >
++                <span className="truncate">{task.title}</span>
++              </Button>
++            ) : (
++              <span className="min-w-0 truncate text-(--ui-text-tertiary)">{shortId(ref.task_id)}</span>
++            )}
++            <span className="shrink-0 text-(--ui-text-quaternary)">{k.origin.board(ref.board)}</span>
++            <span className="ml-auto min-w-0 max-w-full text-(--ui-text-secondary)">
++              {task
++                ? activityLabel(ref, k)
++                : (k.origin.evidence[ref.evidence as keyof typeof k.origin.evidence] ?? k.origin.state.unavailable)}
++            </span>
++            {task && (
++              <Button
++                aria-label={k.origin.logs(task.title)}
++                onClick={() => openLinkedTask({ board: ref.board, id: ref.task_id, section: 'log' })}
++                size="xs"
++                type="button"
++                variant="ghost"
++              >
++                {k.workerLog}
++              </Button>
++            )}
++          </li>
++        )
++      })}
++      {view.truncated && (
++        <li className="text-[0.625rem] text-(--ui-text-quaternary)">{truncationText(k, view.truncated)}</li>
++      )}
++    </ul>
++  )
++}
++
++export function OriginStrip({ context }: { context: SessionRouteContext }) {
++  const k = useKanban()
++  const view = useOriginView(context)
++  const expanded = useValue($expanded)
++  const key = `${context.connectionId}\0${context.profile}\0${context.sessionId}`
++
++  if (view.kind === 'loading' || view.kind === 'out-of-scope') {
++    return null
++  }
++
++  if (view.kind === 'unavailable') {
++    return (
++      <p
++        className="flex items-center gap-1.5 text-[0.6875rem] text-(--ui-text-tertiary)"
++        data-kanban-origin-unavailable={view.reason}
++        role="status"
++      >
++        <Codicon name="warning" size="0.7rem" />
++        {view.reason === 'request' ? k.origin.unreadable : k.origin.unknownHere}
++      </p>
++    )
++  }
++
++  if (view.refs.length === 0) {
++    // Nothing linked paints nothing — unless the answer was incomplete, which must be said out loud.
++    return view.truncated ? (
++      <p
++        className="flex items-center gap-1.5 text-[0.6875rem] text-(--ui-text-tertiary)"
++        data-kanban-origin-truncated=""
++        role="status"
++      >
++        <Codicon name="warning" size="0.7rem" />
++        {truncationText(k, view.truncated)}
++      </p>
++    ) : null
++  }
++
++  const open = expanded[key] === true
++  const { state } = summarizeOrigin(view.refs)
++  const meta = STATE_META[state ?? 'unknown']
++
++  return (
++    <section className="flex min-w-0 flex-col gap-1" data-slot="kanban-origin-strip">
++      <Button
++        aria-expanded={open}
++        aria-label={open ? k.origin.collapse : k.origin.expand}
++        className="w-full justify-start gap-1.5"
++        onClick={() => $expanded.set({ ...$expanded.get(), [key]: !open })}
++        size="xs"
++        type="button"
++        variant="ghost"
++      >
++        <Codicon className={meta.tone} name={meta.icon} size="0.75rem" />
++        <span>{k.origin.title}</span>
++        <span className="text-(--ui-text-tertiary)">{k.origin.summary(view.refs.length)}</span>
++        {state && (
++          <span className="min-w-0 truncate text-(--ui-text-tertiary)">
++            · {view.refs.length === 1 ? activityLabel(view.refs[0], k) : k.origin.state[state]}
++          </span>
++        )}
++        <Codicon className="ml-auto" name={open ? 'chevron-up' : 'chevron-down'} size="0.7rem" />
++      </Button>
++      {open && <OriginList view={view} />}
++    </section>
++  )
++}
+diff --git a/apps/desktop/src/plugins/kanban/plugin.tsx b/apps/desktop/src/plugins/kanban/plugin.tsx
+index 5836071773cff6ceadaf2729448e1777abf1451d..4f389119a1cc888cb155d488b0c0a41cac00e2b5 100644
+--- a/apps/desktop/src/plugins/kanban/plugin.tsx
++++ b/apps/desktop/src/plugins/kanban/plugin.tsx
+@@ -14,6 +14,8 @@ import './kanban.css'
+ import {
+   cn,
+   Codicon,
++  COMPOSER_AREAS,
++  type ComposerSessionContribution,
+   type HermesPlugin,
+   host,
+   type KeybindContribution,
+@@ -22,6 +24,8 @@ import {
+   type PaletteContribution,
+   type RouteContribution,
+   ROUTES_AREA,
++  SESSION_ROW_AREAS,
++  type SessionRowSlotContribution,
+   SIDEBAR_NAV_AREA,
+   type SidebarNavContribution,
+   STATUSBAR_AREAS,
+@@ -33,6 +37,7 @@ import {
+ import { $boardSlug, bindApi, boardKey, fetchBoard, useKanbanScope } from './api'
+ import { KanbanBoardPage } from './board'
+ import { KANBAN_LOCALES } from './i18n'
++import { OriginRowBadge, OriginStrip } from './origin-ui'
+ import { $newTaskLane, useKanban } from './ui'
+ 
+ // Live "N running / ready" pill — one glance at fleet activity from anywhere,
+@@ -116,6 +121,18 @@ const plugin: HermesPlugin = {
+         area: STATUSBAR_AREAS.right,
+         order: 80,
+         render: () => <KanbanCount />
++      },
++      // Conversation surfaces: the tasks a chat ordered, on its sidebar row and above
++      // its composer. Both consume core's generic session context — no core import of kanban.
++      {
++        id: 'origin-badge',
++        area: SESSION_ROW_AREAS.trailing,
++        data: { render: context => <OriginRowBadge context={context} /> } satisfies SessionRowSlotContribution
++      },
++      {
++        id: 'origin-strip',
++        area: COMPOSER_AREAS.session,
++        data: { render: context => <OriginStrip context={context} /> } satisfies ComposerSessionContribution
+       }
+     ])
+ 
+diff --git a/apps/desktop/src/plugins/kanban/types.ts b/apps/desktop/src/plugins/kanban/types.ts
+index 0b8735d4b5ca7dba0a9c97600c513d1f5ad36d56..5f35b8d2ac5bda0cd5d509a99281bd68c47d9a79 100644
+--- a/apps/desktop/src/plugins/kanban/types.ts
++++ b/apps/desktop/src/plugins/kanban/types.ts
+@@ -215,6 +215,71 @@ export interface WorkerLog {
+   truncated: boolean
+ }
+ 
++/** What the board's own rows say a linked task is doing (`kanban_origin.classify_activity`).
++ *  `background` is the ONLY execution claim, and needs a fresh heartbeat or worker spawn; a live
++ *  claim alone is `reserved`, no evidence at all is `unknown`, evidence gone old is `stale`. */
++export type OriginActivity =
++  | 'archived'
++  | 'background'
++  | 'blocked'
++  | 'done'
++  | 'needs-input'
++  | 'queued'
++  | 'reserved'
++  | 'review'
++  | 'stale'
++  | 'unknown'
++  | 'waiting'
++
++/** Whether the board could confirm an indexed ref. Anything but `ok` carries no task facts. */
++export type OriginEvidence = 'board_missing' | 'board_unreadable' | 'not_associated' | 'ok' | 'task_missing'
++
++export interface OriginTaskSummary {
++  id: string
++  title: string
++  status: string
++  assignee?: null | string
++  block_kind?: null | string
++  created_at?: null | number
++  completed_at?: null | number
++  last_heartbeat_at?: null | number
++  claim_expires?: null | number
++  current_run_id?: null | number
++  activity: OriginActivity
++  activity_evidence: string
++  /** Current open run only; the backend resolves the role in the owning home.
++   *  Optional for older backends. Never infer a review phase from `assignee`. */
++  current_executor?: null | {
++    profile: string
++    display_name: null | string
++    phase: 'execution' | 'review'
++  }
++}
++
++export interface OriginRef {
++  /** The lineage segment the reference was indexed under (maps back to a row's `lineageIds`). */
++  origin_session_id: string
++  board: string
++  task_id: string
++  indexed_at: number
++  source: string
++  evidence: OriginEvidence
++  task: null | OriginTaskSummary
++}
++
++/** GET /origin-tasks — linked tasks for the requested conversations in the request's profile. */
++export interface OriginTasksResponse {
++  profile: string
++  now: number
++  refs: OriginRef[]
++  /** Requested ids this profile's store does not know — never reported as "no tasks". */
++  unknown_sessions: string[]
++  /** Each known requested id → the compression chain the answering profile's own store resolved for it
++   *  (root first). Absent on older backends; the client then trusts only the ids it sent. */
++  lineage?: Record<string, string[]>
++  truncated: { lineage: boolean; refs: boolean; sessions: boolean; total_refs: number }
++}
++
+ /** GET /orchestration — dispatcher knobs from config.yaml + resolved values. */
+ export interface OrchestrationSettings {
+   orchestrator_profile: string
+diff --git a/apps/desktop/src/plugins/kanban/ui.tsx b/apps/desktop/src/plugins/kanban/ui.tsx
+index 82fa1cfa5231f94e89ad668161fc166fe65f5b29..a29d6ff8b43e1f18691511334670a74bdcb44850 100644
+--- a/apps/desktop/src/plugins/kanban/ui.tsx
++++ b/apps/desktop/src/plugins/kanban/ui.tsx
+@@ -10,6 +10,7 @@ import {
+   DropdownMenuItem,
+   DropdownMenuTrigger,
+   FadeScroll,
++  host,
+   profileColor,
+   profileColorSoft,
+   relativeTime,
+@@ -32,6 +33,25 @@ export { columnHelp, columnLabel, type KanbanText, lockedReason, useKanban } fro
+  *  persisted, so a remount can't reopen a dialog the user already dismissed. */
+ export const $newTaskLane = atom<null | string>(null)
+ 
++/** One-shot "open this task's drawer" request from outside the board page (a
++ *  conversation's linked-task list). Same contract as `$newTaskLane`: the
++ *  caller parks it and navigates, the page consumes it on arrival — switching
++ *  to the task's board first, since the drawer is keyed to `$boardSlug` — and
++ *  clears it. `section: 'log'` opens the drawer on the worker log. The user
++ *  always initiates it; nothing opens it for a background event. */
++export interface RequestedTask {
++  board: string
++  id: string
++  section?: 'log'
++}
++
++export const $requestedTask = atom<null | RequestedTask>(null)
++
++export function openLinkedTask(request: RequestedTask): void {
++  $requestedTask.set(request)
++  host.navigate('/kanban')
++}
++
+ /** Orchestration knobs (cached app-wide; the settings panel invalidates). */
+ export function useOrchestration() {
+   const scope = useKanbanScope()
+diff --git a/apps/desktop/src/sdk/index.ts b/apps/desktop/src/sdk/index.ts
+index de411600f934f4275e9ee612b8a9c00ca73ea815..667d603dc02db642668e26d9f4a982f559f06d0c 100644
+--- a/apps/desktop/src/sdk/index.ts
++++ b/apps/desktop/src/sdk/index.ts
+@@ -1574,6 +1574,12 @@ export {
+   type ComposerModelPillContext,
+   type ComposerModelPillProvider
+ } from '@/app/chat/composer/contrib'
++/** `composer.session`: register a `data: { render(context) }` contribution to
++ *  paint a strip above the composer's status stack for THAT composer's
++ *  conversation. The context is core's answer to "which conversation, whose
++ *  profile, which connection, reachable by plugin REST?" — see
++ *  `SessionRouteContext`. */
++export type { ComposerSessionContribution } from '@/app/chat/composer/session-slot'
+ /** THE session status dot — the one primitive the sidebar row, the pane tabs
+  *  and the session switcher render, so a session's status can never disagree
+  *  between surfaces. Pass the STORED session id and it resolves the rest
+@@ -1870,8 +1876,14 @@ export { reasoningEffortLabel } from '@/lib/reasoning-effort'
+ export { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
+ /** Row-decoration slots: register a `data` contribution with a `render` for
+  *  `SESSION_ROW_AREAS.leading` / `.trailing` to decorate sidebar session rows
+- *  (the props carry the row's stored session id). */
+-export { SESSION_ROW_AREAS, type SessionRowSlotContribution, type SessionRowSlotProps } from '@/lib/session-row-slots'
++ *  (the props are the row's `SessionRouteContext`: stored id, lineage ids,
++ *  owner profile + connection, and whether plugin REST reaches that owner). */
++export {
++  SESSION_ROW_AREAS,
++  type SessionRouteContext,
++  type SessionRowSlotContribution,
++  type SessionRowSlotProps
++} from '@/lib/session-row-slots'
+ /** A sibling WebSocket beside the route's `/api/ws` (voice PCM, Bot Screen RFB):
+  *  same origin, same auth resolution as chat. */
+ export { resolveSiblingWsUrl, type SiblingWsRoute } from '@/lib/sibling-ws-url'
+diff --git a/apps/desktop/src/store/session-route-context.test.ts b/apps/desktop/src/store/session-route-context.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a2d51b58c3c257e10beac265d442a43cac0974b
+--- /dev/null
++++ b/apps/desktop/src/store/session-route-context.test.ts
+@@ -0,0 +1,82 @@
++import { describe, expect, it, vi } from 'vitest'
++
++import type { SessionInfo } from '@/types/hermes'
++
++import { runtimeRouteContext, sessionRouteContext } from './session-route-context'
++import { recordSessionEventScope } from './session-states'
++
++// `runtimeSessionOwner` is typed to admit null; the real map never stores it, so a test has to
++// force it. Everything else in the module is genuine.
++const forced = vi.hoisted(() => ({ owner: undefined as null | undefined, active: false }))
++
++vi.mock('./session-states', async importOriginal => {
++  const actual = await importOriginal<Record<string, unknown>>()
++
++  return {
++    ...actual,
++    runtimeSessionOwner: (id: null | string | undefined) =>
++      forced.active ? forced.owner : (actual.runtimeSessionOwner as (id: unknown) => unknown)(id)
++  }
++})
++
++const row = (over: Partial<SessionInfo>): SessionInfo => ({ id: 'tip', profile: 'default', ...over }) as SessionInfo
++const here = { connectionId: null, profile: 'default' }
++
++describe('session route context', () => {
++  it('gives a compressed conversation one durable id and every id it has answered to', () => {
++    const context = sessionRouteContext(row({ _lineage_ids: ['root', 'mid', 'tip'], _lineage_root_id: 'root' }), here)
++
++    expect(context.sessionId).toBe('root')
++    expect([...context.lineageIds].sort()).toEqual(['mid', 'root', 'tip'])
++  })
++
++  it('is reachable by plugin REST only when the row’s route is the active route', () => {
++    // Primary pool rows are bare; `local` and "no id" are the same primary pool.
++    expect(sessionRouteContext(row({}), here).ambient).toBe(true)
++    expect(sessionRouteContext(row({}), { connectionId: 'local', profile: 'default' }).ambient).toBe(true)
++    expect(sessionRouteContext(row({ connection_id: 'local' }), here).ambient).toBe(true)
++    expect(sessionRouteContext(row({ profile: 'research' }), here).ambient).toBe(false)
++    expect(sessionRouteContext(row({ connection_id: 'spark' }), here).ambient).toBe(false)
++
++    // A REMOTE primary is registry-pinned: its rows are tagged with its own id, so they match the
++    // active descriptor — a bare row there would be the primary pool, not the active remote.
++    const remotePrimary = { connectionId: 'spark', profile: 'default' }
++
++    expect(sessionRouteContext(row({ connection_id: 'spark' }), remotePrimary).ambient).toBe(true)
++    expect(sessionRouteContext(row({}), remotePrimary).ambient).toBe(false)
++    // Same profile name on another connection is another backend.
++    expect(sessionRouteContext(row({ connection_id: 'vps' }), remotePrimary).ambient).toBe(false)
++  })
++
++  it('resolves a composer’s runtime session through the listed row, and has none for a draft', () => {
++    const sessions = [row({ _lineage_ids: ['root', 'tip'], _lineage_root_id: 'root', profile: 'research' })]
++
++    expect(runtimeRouteContext('root', sessions, here, 'rt-1')).toMatchObject({
++      ambient: false,
++      profile: 'research',
++      sessionId: 'root'
++    })
++    expect(runtimeRouteContext(null, sessions, here, 'rt-1')).toBeNull()
++  })
++
++  it('takes the connection its events proved for a bare row, and never throws without an owner', () => {
++    recordSessionEventScope({ connectionId: 'spark', profile: 'default', session_id: 'rt-spark' })
++    const remote = { connectionId: 'spark', profile: 'default' }
++
++    // A bare optimistic row, but the runtime's own events came from `spark`.
++    expect(runtimeRouteContext('tip', [row({})], remote, 'rt-spark')?.ambient).toBe(true)
++    // No proof and a bare row under that active remote: fail closed.
++    expect(runtimeRouteContext('tip', [row({})], remote, 'rt-unknown')?.ambient).toBe(false)
++
++    // Unlisted session: owner null/undefined falls back to the ACTIVE route, never throws.
++    forced.active = true
++    forced.owner = null
++
++    try {
++      expect(runtimeRouteContext('fresh', [], here, 'rt-null')).toMatchObject({ ambient: true, profile: 'default' })
++      expect(runtimeRouteContext('fresh', [row({ id: 'other' })], here, null)).toMatchObject({ connectionId: '' })
++    } finally {
++      forced.active = false
++    }
++  })
++})
+diff --git a/apps/desktop/src/store/session-route-context.ts b/apps/desktop/src/store/session-route-context.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd056a1dd1033b80d2c04cbab26e80c3f1ae2857
+--- /dev/null
++++ b/apps/desktop/src/store/session-route-context.ts
+@@ -0,0 +1,103 @@
++/**
++ * SESSION ROUTE CONTEXT — the generic "who/where is this conversation" answer
++ * handed to per-session plugin decorations (sidebar rows, the composer's
++ * session strip). Core owns lineage, ownership and routing; a plugin consumes
++ * the result and never imports another feature's stores.
++ */
++
++import { LOCAL_CONNECTION_ID } from '@hermes/shared'
++import { computed } from 'nanostores'
++
++import type { SessionRouteContext } from '@/lib/session-row-slots'
++import type { SessionInfo } from '@/types/hermes'
++
++import { $activeConnectionId } from './connections'
++import { $activeGatewayProfile, normalizeProfileKey } from './profile'
++import { sessionMatchesStoredId, sessionPinId } from './session'
++import { runtimeSessionOwner } from './session-states'
++
++type RouteRow = Pick<SessionInfo, '_lineage_ids' | '_lineage_root_id' | 'connection_id' | 'id' | 'profile'>
++
++/**
++ * Row tags are the canonical route, so an UNTAGGED row is exactly "served by the primary pool".
++ * Evidence (electron/profile-session-routing.ts `tagRegistrySessionResponse`; store/session.ts
++ * `sessionOwnerRouteFromRow`, `stampMessagingRowsWithListServer`): every response from a
++ * registry-pinned backend — including a REMOTE primary — is tagged with its registry id, and only
++ * the primary pool (local, or the legacy primary-SSH path whose descriptor has no registry id) leaves
++ * rows bare. `local` and "no id" therefore name the same primary pool, and a bare row is reachable
++ * only while the active route is that pool. A bare row under an active non-primary registry
++ * connection (`spark`) is NOT reachable: plugin REST would hit `spark`'s data. Fail closed.
++ */
++const connectionKey = (id: null | string | undefined): string => {
++  const value = String(id ?? '').trim()
++
++  return value === LOCAL_CONNECTION_ID ? '' : value
++}
++
++export interface ActiveRoute {
++  connectionId: null | string
++  profile: string
++}
++
++export function sessionRouteContext(session: RouteRow, active: ActiveRoute): SessionRouteContext {
++  const connectionId = connectionKey(session.connection_id)
++  const profile = normalizeProfileKey(session.profile)
++
++  return {
++    ambient: connectionId === connectionKey(active.connectionId) && profile === normalizeProfileKey(active.profile),
++    connectionId,
++    lineageIds: [
++      ...new Set([session.id, session._lineage_root_id, ...(session._lineage_ids ?? [])].filter(Boolean) as string[])
++    ],
++    profile,
++    sessionId: sessionPinId(session)
++  }
++}
++
++/** The active route plugin REST is currently pinned to. */
++export const $activeRoute = computed(
++  [$activeConnectionId, $activeGatewayProfile],
++  (connectionId, profile): ActiveRoute => ({ connectionId, profile })
++)
++
++/**
++ * Context for a RUNTIME session (the composer's identity): its stored id and
++ * lineage come from the listed row when there is one; the owner comes from the
++ * row, else from what the runtime's own events proved, else the active route.
++ * A session with no stored id yet (fresh draft) has no durable conversation to
++ * describe → null.
++ */
++export function runtimeRouteContext(
++  storedSessionId: null | string | undefined,
++  sessions: readonly SessionInfo[],
++  active: ActiveRoute,
++  runtimeId: null | string | undefined
++): null | SessionRouteContext {
++  const stored = String(storedSessionId ?? '').trim()
++
++  if (!stored) {
++    return null
++  }
++
++  const row = sessions.find(session => sessionMatchesStoredId(session, stored))
++  const owner = runtimeSessionOwner(runtimeId)
++  // A bare profile string (legacy pool) or nothing proves no connection.
++  const route = owner && typeof owner === 'object' ? owner : null
++
++  if (row) {
++    // The runtime's own events proved an exact connection; a bare row (optimistic, not yet
++    // re-tagged by a list refresh) must not lose it to the primary pool.
++    const tagged = !row.connection_id?.trim() && route ? { ...row, connection_id: route.connectionId } : row
++
++    return sessionRouteContext(tagged, active)
++  }
++
++  return sessionRouteContext(
++    {
++      connection_id: route?.connectionId,
++      id: stored,
++      profile: typeof owner === 'string' ? owner : (route?.profile ?? active.profile)
++    },
++    active
++  )
++}
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index f85857ddcbe464a5529fa3bb7a8ef72ca6d92fec..98fe05703c904ec9212c77bba232217ee37f7460 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -139,6 +139,12 @@ def add_notify_sub(
+                 f"UPDATE kanban_notify_subs SET {column} = ? " + _SUB_KEY_WHERE + guard,
+                 (value, *key),
+             )
++    if platform.lower() == "tui":
++        # Navigation index for the origin conversation (best-effort; see kanban_origin).
++        from hermes_cli import kanban_origin
++
++        kanban_origin.index_subscription(
++            conn, task_id=task_id, platform=platform, chat_id=chat_id, notifier_profile=notifier_profile)
+ 
+ 
+ def _notify_profile_filter(
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1f51249915a74190e183f8b4eeb71ee51af6318
+--- /dev/null
++++ b/hermes_cli/kanban_origin.py
+@@ -0,0 +1,419 @@
++"""Durable origin references: which board tasks a conversation ordered.
++
++A navigation index, never a source of truth. Each ``(origin session, board, task)`` triple is one
++independent ``state_meta`` key in the OWNING profile's ``state.db`` (``kanban_origin:<session>:<board>:<task>``),
++so concurrent writers never read-merge-write a shared value. The board database stays authoritative for
++every task fact: the reader below re-opens only the boards the index names, read-only and without
++init/migration, and re-verifies each ref against the board's own ``tasks.session_id`` / ``tui``
++subscription before reporting it linked.
++
++Writers (best-effort — an index failure never changes task creation or subscription semantics):
++
++* ``index_created_task`` — ``kanban_create``, for the session verified in the calling profile's
++  ``state.db``, plus the ``tui`` subscriptions the new task carries (a worker-created task inherits its
++  owner's; those encode the ORIGINAL owner's profile and are verified in THAT profile's store, never the
++  worker's).
++* ``index_subscription`` — ``add_notify_sub`` for ``platform="tui"`` with an explicit ``notifier_profile``.
++
++Tasks created before this index existed are not discovered and nothing sweeps boards to backfill them:
++re-subscribing the task (``hermes kanban notify-subscribe``) indexes it. The board slug comes from the
++connection's own file, never from the ambient current board; a connection that is not a known board file
++(e.g. a custom ``HERMES_KANBAN_DB``) is simply not indexed.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import time
++from contextlib import closing, nullcontext
++from pathlib import Path
++from typing import Any, Iterable, Optional
++
++logger = logging.getLogger(__name__)
++
++KEY_PREFIX = "kanban_origin:"
++
++# Reader bounds. Every bound is reported through ``truncated``; none silently skips an indexed board.
++MAX_SEED_SESSIONS = 64
++MAX_LINEAGE_IDS = 256
++MAX_REFS = 200
++
++_TERMINAL = ("done", "archived")
++
++
++def origin_key(session_id: str, board: str, task_id: str) -> str:
++    return f"{KEY_PREFIX}{session_id}:{board}:{task_id}"
++
++
++def _parse_key(key: str, session_id: str) -> Optional[tuple[str, str]]:
++    """``(board, task_id)`` when *key* belongs to exactly *session_id* (a prefix scan for ``a`` also
++    sees ``a:b``'s keys; board slugs and task ids never contain ``:``)."""
++    head, _, task_id = key[len(KEY_PREFIX):].rpartition(":")
++    sid, sep, board = head.rpartition(":")
++    return (board, task_id) if sep and sid == session_id and board and task_id else None
++
++
++def _meta_fields(value: Any) -> tuple[int, str]:
++    """``(indexed_at, source)`` from a ref's value. The value only annotates a ref that the key already
++    proves; anything unreadable or of another JSON type degrades to ``(0, "")`` and the ref is kept."""
++    try:
++        meta = json.loads(value)
++    except (TypeError, ValueError):
++        return 0, ""
++    if not isinstance(meta, dict):
++        return 0, ""
++    at, src = meta.get("at"), meta.get("src")
++    return (at if isinstance(at, int) and not isinstance(at, bool) and at > 0 else 0), (src if isinstance(src, str) else "")
++
++
++# --- writers -----------------------------------------------------------------
++
++def board_slug_for_connection(conn: sqlite3.Connection) -> Optional[str]:
++    """The slug of the board *conn* is actually open on, or None when its file is not a known board."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    raw = kbc._main_db_file(conn)
++    if not raw:
++        return None
++    try:
++        path = Path(raw).resolve()
++        if path == (kb.kanban_home() / "kanban.db").resolve():
++            return kb.DEFAULT_BOARD
++        if path.name == "kanban.db" and path.parent.parent == kb.boards_root().resolve():
++            return kb._normalize_board_slug(path.parent.name)
++    except (OSError, ValueError):
++        pass
++    return None
++
++
++def _owner_state_db(profile: str) -> Optional[Path]:
++    """An EXISTING profile's ``state.db``. A missing/invalid/tombstoned named profile yields None —
++    never the default profile's store."""
++    from hermes_cli.profiles import get_profile_dir, normalize_profile_name, profile_exists
++
++    try:
++        canon = normalize_profile_name(profile)
++        if not profile_exists(canon):
++            return None
++        path = get_profile_dir(canon) / "state.db"
++    except (OSError, ValueError):
++        return None
++    return path if path.exists() else None
++
++
++def _record(state_db: Path, session_id: str, board: str, task_id: str, source: str) -> bool:
++    """Index one ref when *session_id* exists in *state_db*; False (never raises) otherwise."""
++    from hermes_state_registry import acquire, release_or_close
++
++    db = None
++    try:
++        db = acquire(state_db)
++        if db.get_session(session_id) is None:
++            return False
++        db.set_meta(
++            origin_key(session_id, board, task_id),
++            json.dumps({"at": int(time.time()), "src": source}, separators=(",", ":")),
++        )
++        return True
++    except Exception:
++        logger.debug("kanban origin index write failed for %s on %s", task_id, board, exc_info=True)
++        return False
++    finally:
++        if db is not None:
++            release_or_close(db)
++
++
++def _index_subscriptions(
++    conn: sqlite3.Connection, task_id: str, board: str, extra_session_id: Optional[str],
++) -> None:
++    from hermes_cli import kanban_db_notify as kbn
++
++    for sub in kbn.list_notify_subs(conn, task_id):
++        profile = (sub.get("notifier_profile") or "").strip()
++        if (sub.get("platform") or "").lower() != "tui" or not profile or not sub.get("chat_id"):
++            continue
++        state_db = _owner_state_db(profile)
++        if state_db is None:
++            continue
++        for session_id in dict.fromkeys(filter(None, (sub["chat_id"], extra_session_id))):
++            _record(state_db, session_id, board, task_id, "sub")
++
++
++def index_created_task(
++    conn: sqlite3.Connection, task_id: str, *, session_id: Optional[str], inherited_session: bool,
++) -> None:
++    """Index a task ``kanban_create`` just wrote. ``session_id`` is the stamped origin;
++    ``inherited_session`` means it came from the creating worker's own task (not verified in the worker's
++    store), so it is indexed only through the owner profiles the inherited subscriptions name."""
++    try:
++        board = board_slug_for_connection(conn)
++        if not board:
++            return
++        if session_id and not inherited_session:
++            from hermes_constants import get_hermes_home
++
++            state_db = get_hermes_home() / "state.db"
++            if state_db.exists():
++                _record(state_db, session_id, board, task_id, "create")
++        _index_subscriptions(conn, task_id, board, session_id)
++    except Exception:
++        logger.debug("kanban origin indexing failed for %s", task_id, exc_info=True)
++
++
++def index_subscription(
++    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str, notifier_profile: Optional[str],
++) -> None:
++    """Index an explicit ``tui`` subscription under its ``notifier_profile``'s store."""
++    profile = (notifier_profile or "").strip()
++    if platform.lower() != "tui" or not profile or not chat_id:
++        return
++    try:
++        board = board_slug_for_connection(conn)
++        state_db = _owner_state_db(profile) if board else None
++        if board and state_db is not None:
++            _record(state_db, chat_id, board, task_id, "sub")
++    except Exception:
++        logger.debug("kanban origin subscription indexing failed for %s", task_id, exc_info=True)
++
++
++# --- reader ------------------------------------------------------------------
++
++_CLOCK_SKEW = 1
++
++
++def _wall_time(value: Any, now: int) -> Optional[int]:
++    """A plausible wall-clock second: an int that is neither negative nor in the future."""
++    if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value > now + _CLOCK_SKEW:
++        return None
++    return value
++
++
++def classify_activity(
++    task: Any, run: Optional[dict], spawned_at: Any, open_parents: int, now: int, claim_window: int,
++) -> tuple[str, str]:
++    """``(activity, evidence)`` for one task from the board's own rows.
++
++    Only evidence belonging to the CURRENT run counts as execution: its heartbeat, or its spawn (a pid
++    on the open run plus the ``spawned``/``worker_registered`` event time — ``worker_started_at`` is a
++    process-identity fingerprint, never a time). A task-level heartbeat left by an earlier run, a live
++    claim alone (a reservation), and timestamps that are negative or in the future prove nothing. A
++    heartbeat or spawn older than the claim window is ``stale``; no usable evidence is ``unknown``.
++    """
++    status = task.status
++    if status == "running":
++        started = _wall_time((run or {}).get("started_at"), now)
++        open_run = run is not None and run.get("ended_at") is None
++        beats = [_wall_time((run or {}).get("last_heartbeat_at"), now)] if open_run else []
++        task_beat = _wall_time(task.last_heartbeat_at, now)
++        if open_run and started is not None and task_beat is not None and task_beat > started:
++            # Equality is ambiguous at second resolution: it can be the previous run's last beat.
++            # Real same-second heartbeats still count through the run-bound timestamp above.
++            beats.append(task_beat)
++        beat = max((b for b in beats if b is not None), default=None)
++        spawn = _wall_time(spawned_at, now) if open_run and run.get("worker_pid") else None
++        if beat is not None:
++            return ("background", "heartbeat") if now - beat <= claim_window else ("stale", "heartbeat_old")
++        if spawn is not None:
++            return ("background", "spawn") if now - spawn <= claim_window else ("stale", "spawn_old")
++        claim = _wall_time(task.claim_expires, now + claim_window + _CLOCK_SKEW)
++        if claim is not None and claim > now:
++            return "reserved", "claim"
++        return "unknown", "none"
++    if status == "blocked":
++        if task.block_kind == "needs_input":
++            return "needs-input", "block_kind"
++        if task.block_kind == "dependency":
++            return "waiting", "block_kind"
++        return "blocked", "block_kind"
++    if status == "review":
++        return "review", "status"
++    if status == "todo":
++        return ("waiting", "parents") if open_parents else ("queued", "status")
++    if status in ("ready", "triage", "scheduled"):
++        return "queued", "status"
++    if status in _TERMINAL:
++        return status, "status"
++    return "unknown", "status"
++
++
++def _open_readonly(board: str) -> tuple[Optional[sqlite3.Connection], str]:
++    """Read-only handle on an existing board file — no init, no migration, no file creation."""
++    from hermes_cli import kanban_db as kb
++
++    try:
++        path = kb.kanban_db_path(board=board)
++        if not path.exists():
++            return None, "board_missing"
++        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
++        conn.row_factory = sqlite3.Row
++        return conn, "ok"
++    except (OSError, ValueError, sqlite3.Error):
++        return None, "board_unreadable"
++
++
++def _executor_display_name(profile: str) -> Optional[str]:
++    """Read only this Home's exact profile metadata, never config or a roster."""
++    from hermes_cli.profiles import read_profile_meta
++    from hermes_constants import get_default_hermes_root, get_hermes_home, named_profile_is_deleted
++
++    try:
++        root = get_default_hermes_root(home=get_hermes_home()).resolve()
++        directory = root if profile == "default" else root / "profiles" / profile
++        # Neither a profile alias nor a metadata symlink may borrow another Home/profile's label.
++        if directory.resolve() != directory or (directory / "profile.yaml").resolve().parent != directory:
++            return None
++        if profile != "default" and named_profile_is_deleted(directory):
++            return None
++        return read_profile_meta(directory)["display_name"] or None
++    except (OSError, ValueError):
++        return None
++
++
++def _current_executor(conn: sqlite3.Connection, task: Any, run: Optional[dict], activity: str) -> Optional[dict]:
++    from hermes_cli import kanban_db as kb
++    from hermes_constants import PROFILE_ID_RE
++
++    if (activity != "background" or not run or run.get("ended_at") is not None
++            or run.get("status") != "running" or run.get("outcome") is not None):
++        return None
++    profile = run.get("profile")
++    if not isinstance(profile, str) or not PROFILE_ID_RE.fullmatch(profile):
++        return None
++    # The native retry classifier reads ONLY this run's claimed.source_status, including
++    # claim_review_task's review -> running transition. Old reviews and role names cannot vote.
++    phase = "review" if kb._retry_status_for_run(conn, task.id, task.current_run_id) == "review" else "execution"
++    return {"profile": profile, "display_name": _executor_display_name(profile), "phase": phase}
++
++
++def _task_summary(task: Any, activity: str, evidence: str, executor: Optional[dict]) -> dict[str, Any]:
++    return {
++        "current_executor": executor,
++        "id": task.id, "title": task.title, "status": task.status, "assignee": task.assignee,
++        "block_kind": task.block_kind, "created_at": task.created_at, "completed_at": task.completed_at,
++        "last_heartbeat_at": task.last_heartbeat_at, "claim_expires": task.claim_expires,
++        "current_run_id": task.current_run_id, "activity": activity, "activity_evidence": evidence,
++    }
++
++
++def _read_ref(
++    conn: sqlite3.Connection, task_id: str, chain: frozenset, profile: str, now: int, claim_window: int,
++) -> tuple[str, Optional[dict]]:
++    from hermes_cli import kanban_db as kb
++
++    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None:
++        return "task_missing", None
++    task = kb.Task.from_row(row)
++    linked = task.session_id in chain
++    if not linked:
++        marks = ",".join("?" * len(chain))
++        linked = conn.execute(
++            f"SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND LOWER(platform) = 'tui' "
++            f"AND chat_id IN ({marks}) AND LOWER(COALESCE(notifier_profile, '')) = ? LIMIT 1",
++            (task_id, *sorted(chain), profile),
++        ).fetchone() is not None
++    if not linked:
++        return "not_associated", None
++    run, spawned_at = None, None
++    if task.current_run_id:
++        found = conn.execute(
++            "SELECT profile, status, outcome, worker_pid, started_at, last_heartbeat_at, ended_at "
++            "FROM task_runs WHERE id = ? AND task_id = ?",
++            (task.current_run_id, task.id)).fetchone()
++        run = dict(found) if found else None
++        if run:
++            spawned_at = conn.execute(
++                "SELECT MAX(created_at) FROM task_events WHERE run_id = ? AND kind IN ('spawned', 'worker_registered')",
++                (task.current_run_id,)).fetchone()[0]
++    open_parents = conn.execute(
++        "SELECT COUNT(*) FROM task_links l JOIN tasks p ON p.id = l.parent_id "
++        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived')", (task_id,)).fetchone()[0]
++    activity, evidence = classify_activity(task, run, spawned_at, int(open_parents), now, claim_window)
++    return "ok", _task_summary(task, activity, evidence, _current_executor(conn, task, run, activity))
++
++
++def origin_tasks(session_ids: Iterable[str], *, now: Optional[int] = None) -> dict[str, Any]:
++    """Linked tasks for the conversations *session_ids* name, resolved in the CURRENT profile scope.
++
++    Lineage is expanded here from this profile's own ``state.db`` (the caller's aliases are only seeds),
++    so an id that exists in another profile contributes nothing. Reads only indexed boards.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.profiles import current_profile_name
++    from hermes_constants import get_hermes_home
++    from hermes_state import SessionDB
++
++    now = int(time.time()) if now is None else now
++    profile = (current_profile_name("default") or "default").strip().lower()
++    seeds = list(dict.fromkeys(s.strip() for s in session_ids if isinstance(s, str) and s.strip()))
++    truncated = {"sessions": len(seeds) > MAX_SEED_SESSIONS, "lineage": False, "refs": False, "total_refs": 0}
++    seeds = seeds[:MAX_SEED_SESSIONS]
++    # ``lineage``: each KNOWN requested seed -> its compression chain as THIS profile's store resolved it
++    # (root first). The caller's own ids may be a lone tip (e.g. after a reload); this is how it learns
++    # which ids its conversation answers to. Unknown seeds are absent, never mapped to a guess.
++    result: dict[str, Any] = {
++        "profile": profile, "now": now, "refs": [], "unknown_sessions": [], "lineage": {},
++        "truncated": truncated}
++
++    state_db = get_hermes_home() / "state.db"
++    if not state_db.exists():
++        result["unknown_sessions"] = seeds
++        return result
++
++    chains: dict[str, frozenset] = {}
++    refs: list[tuple[int, str, str, str, str]] = []
++    # Read-only attach: a GET never creates, migrates or write-locks a profile's store. A store that
++    # cannot be read raises (the route answers 5xx, which the UI shows as unavailable) — never an empty list.
++    db = SessionDB(db_path=state_db, read_only=True)
++    try:
++        for seed in seeds:
++            if db.get_session(seed) is None:
++                result["unknown_sessions"].append(seed)
++                continue
++            ordered_chain = list(dict.fromkeys([*(db.get_compression_lineage(seed) or []), seed]))
++            result["lineage"][seed] = ordered_chain
++            chain = frozenset(ordered_chain)
++            for sid in chain:
++                chains[sid] = chain
++        if len(chains) > MAX_LINEAGE_IDS:
++            truncated["lineage"] = True
++        for sid in sorted(chains)[:MAX_LINEAGE_IDS]:
++            for key, value in db.list_meta_prefix(f"{KEY_PREFIX}{sid}:"):
++                parsed = _parse_key(key, sid)
++                if parsed:
++                    at, src = _meta_fields(value)
++                    refs.append((at, sid, parsed[0], parsed[1], src))
++    finally:
++        db.close()
++
++    newest: dict[tuple[str, str], tuple[int, str, str, str, str]] = {}
++    for ref in sorted(refs, reverse=True):
++        newest.setdefault((ref[2], ref[3]), ref)
++    ordered = sorted(newest.values(), reverse=True)
++    truncated["total_refs"] = len(ordered)
++    truncated["refs"] = len(ordered) > MAX_REFS
++    ordered = ordered[:MAX_REFS]
++
++    claim_window = kb._resolve_claim_ttl_seconds()
++    by_board: dict[str, list] = {}
++    for ref in ordered:
++        by_board.setdefault(ref[2], []).append(ref)
++    out: dict[tuple[str, str], dict[str, Any]] = {}
++    for board, board_refs in by_board.items():
++        conn, state = _open_readonly(board)
++        with closing(conn) if conn is not None else nullcontext():
++            for at, sid, _board, task_id, src in board_refs:
++                evidence, task = state, None
++                if conn is not None:
++                    try:
++                        evidence, task = _read_ref(conn, task_id, chains[sid], profile, now, claim_window)
++                    except sqlite3.Error:
++                        evidence = "board_unreadable"
++                out[(board, task_id)] = {
++                    "origin_session_id": sid, "board": board, "task_id": task_id, "indexed_at": at,
++                    "source": src, "evidence": evidence, "task": task}
++    result["refs"] = [out[(r[2], r[3])] for r in ordered]
++    return result
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index c38f8e399bdca0d8cf7f5cb1c9ed8e383302e1c8..34d81a5df46b20a6ecd94e6ba5428dd6232403d6 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -933,6 +933,16 @@ def list_active_workers(board: Optional[str] = _BOARD_Q):
+         return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
+ 
+ 
++@router.get("/origin-tasks")
++def get_origin_tasks(session_ids: str = Query("", description="Comma-separated conversation ids to resolve")):
++    """Tasks the named conversations ordered, in the REQUEST's profile scope. Reads only the boards the
++    origin index names (read-only, no init); see ``hermes_cli.kanban_origin``."""
++    from hermes_cli import kanban_origin
++
++    with _errors_to_500("failed to read origin tasks"):
++        return kanban_origin.origin_tasks(session_ids.split(","))
++
++
+ @router.get("/runs/{run_id}")
+ def get_run_endpoint(run_id: int, board: Optional[str] = _BOARD_Q):
+     """``{run: {...}}`` with the same serialisation as ``GET /tasks/{id}``; 404 if unknown."""
+diff --git a/tests/hermes_cli/test_kanban_origin.py b/tests/hermes_cli/test_kanban_origin.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c2bd4d45a7f2ae2cd2f9f3181ee7ee60d5bb385
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin.py
+@@ -0,0 +1,213 @@
++"""Origin index: producer (``kanban_create`` / tui subscribe) -> ``state_meta`` -> reader.
++
++The index is a navigation aid; every assertion that matters is about what the reader reports after
++re-opening the board itself: lineage, boards, profiles, and honest per-ref failures.
++"""
++import json
++from pathlib import Path
++
++import pytest
++
++from gateway.session_context import scoped_current_session_id
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli.kanban_origin import origin_tasks
++from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++from hermes_state import SessionDB
++from tools import kanban_tools as kt
++
++
++@pytest.fixture
++def homes(tmp_path, monkeypatch):
++    """Default profile + named profile ``b`` sharing one board root (the kanban root is host-wide)."""
++    default = tmp_path / ".hermes"
++    named = default / "profiles" / "b"
++    named.mkdir(parents=True)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(default))
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_HOME"):
++        monkeypatch.delenv(var, raising=False)
++    kb.init_db()
++    return default, named
++
++
++def seed_sessions(home, *ids):
++    db = SessionDB(db_path=home / "state.db")
++    for sid in ids:
++        db.create_session(sid, source="cli")
++    db.close()
++
++
++def seed_compression(home, root, tip):
++    db = SessionDB(db_path=home / "state.db")
++    db.create_session(root, source="cli")
++    db.end_session(root, "compression")
++    db.create_session(tip, source="cli", parent_session_id=root)
++    db.close()
++
++
++def in_profile(home, fn):
++    token = set_hermes_home_override(home)
++    try:
++        return fn()
++    finally:
++        reset_hermes_home_override(token)
++
++
++def create(**args):
++    result = json.loads(kt._handle_create({"title": "t", "assignee": "default", **args}))
++    assert result["ok"], result
++    return result["task_id"]
++
++
++def linked(result):
++    return {(r["board"], r["task_id"]): r["evidence"] for r in result["refs"]}
++
++
++def test_created_tasks_are_found_across_boards_and_lineage_then_failures_stay_visible(homes, monkeypatch):
++    default, _ = homes
++    kb.create_board("alpha")
++    seed_compression(default, "root-1", "tip-1")
++    # Strict no-scan: a reader that enumerated boards would trip this.
++    monkeypatch.setattr(kb, "list_boards", lambda **_: pytest.fail("reader enumerated boards"))
++
++    with scoped_current_session_id("root-1"):
++        on_alpha = create(board="alpha")
++    with scoped_current_session_id("tip-1"):
++        on_default = create()
++
++    # Asked by the compression TIP only: the root-stamped task on the other board still resolves.
++    result = origin_tasks(["tip-1"])
++    assert linked(result) == {("alpha", on_alpha): "ok", ("default", on_default): "ok"}
++    assert result["truncated"]["refs"] is False
++
++    kb.remove_board("alpha", archive=False)
++    with kbc.connect_closing() as conn:
++        conn.execute("DELETE FROM tasks WHERE id = ?", (on_default,))
++        conn.commit()
++    after = origin_tasks(["tip-1"])
++    assert linked(after) == {("alpha", on_alpha): "board_missing", ("default", on_default): "task_missing"}
++
++
++def test_index_and_reader_stay_inside_the_owning_profile(homes):
++    from agent.secret_scope import set_multiplex_active
++    from hermes_cli.web_server_profiles import _config_profile_scope
++
++    default, named = homes
++    for home in (default, named):
++        seed_sessions(home, "shared-id")  # the same literal id exists in both stores
++
++    def create_as(home):
++        def run():
++            with scoped_current_session_id("shared-id"):
++                return create()
++        return in_profile(home, run)
++
++    task_a, task_b = create_as(default), create_as(named)
++
++    # Reads go through the dashboard's real per-request profile scope, with the process already a
++    # multi-profile host (conftest resets the latch): an unbound read would fail closed, not borrow.
++    set_multiplex_active(True)
++
++    def seen(profile):
++        with _config_profile_scope(profile):
++            return {t for _b, t in linked(origin_tasks(["shared-id"]))}
++
++    assert seen(None) == {task_a}
++    assert seen("b") == {task_b}
++    assert seen(None) == {task_a}  # A -> B -> A
++    assert seen("b") == {task_b}
++
++
++def test_a_tip_only_request_exposes_only_its_own_resolved_chain(homes):
++    default, named = homes
++    seed_compression(default, "root-1", "tip-1")
++    seed_compression(default, "other-root", "other-tip")  # an unrelated chain in the same store
++    seed_sessions(named, "tip-1")  # the same literal tip id in another profile, with no lineage
++    with scoped_current_session_id("root-1"):
++        task = create()  # ordered under the ROOT
++
++    # After a reload the client may hold only the tip; the backend resolves the rest itself.
++    result = origin_tasks(["tip-1", "ghost"])
++
++    assert result["lineage"] == {"tip-1": ["root-1", "tip-1"]}  # unknown seeds are absent, not guessed
++    assert result["unknown_sessions"] == ["ghost"]
++    assert [(r["origin_session_id"], r["task_id"]) for r in result["refs"]] == [("root-1", task)]
++
++    other_profile = in_profile(named, lambda: origin_tasks(["tip-1"]))
++
++    assert other_profile["lineage"] == {"tip-1": ["tip-1"]}  # its own store's answer, not default's chain
++    assert other_profile["refs"] == []
++
++
++def test_executor_label_is_bound_to_the_active_home_not_launch_home(homes, tmp_path):
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    first, _ = homes
++    second = tmp_path / "second-home"
++    second.mkdir()
++    tasks = []
++    for home, label in ((first, "First engineer"), (second, "Second engineer")):
++        directory = home / "profiles" / "worker"
++        directory.mkdir(parents=True)
++        (directory / "profile.yaml").write_text(f"display_name: {label}\n", encoding="utf-8")
++        seed_sessions(home, "same-origin")
++
++        def setup():
++            with scoped_current_session_id("same-origin"):
++                task = create(assignee="worker")
++            with kbc.connect_closing() as conn:
++                assert kb.claim_task(conn, task) is not None
++                kbd.heartbeat_worker(conn, task)
++            return task
++
++        tasks.append(in_profile(home, setup))
++
++    for home, task, label in ((first, tasks[0], "First engineer"), (second, tasks[1], "Second engineer"),
++                              (first, tasks[0], "First engineer")):
++        result = in_profile(home, lambda: origin_tasks(["same-origin"]))
++        assert [r["task_id"] for r in result["refs"]] == [task]
++        assert result["refs"][0]["task"]["current_executor"] == {
++            "profile": "worker", "display_name": label, "phase": "execution"}
++
++
++def test_a_read_never_creates_a_profiles_store(homes):
++    _default, named = homes  # profile b exists but has never held a session
++
++    result = in_profile(named, lambda: origin_tasks(["anything"]))
++
++    assert result["refs"] == [] and result["unknown_sessions"] == ["anything"]
++    assert not (named / "state.db").exists()
++
++
++def test_worker_inherited_subscription_indexes_the_owner_never_the_worker(homes, monkeypatch):
++    default, named = homes
++    seed_sessions(default, "origin-1")
++    with kbc.connect_closing() as conn:
++        owner = kb.create_task(conn, title="owner", session_id="origin-1")
++        kbn.add_notify_sub(conn, task_id=owner, platform="tui", chat_id="origin-1", notifier_profile="default")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
++
++    child = in_profile(named, create)  # created by a worker running as profile b
++
++    assert linked(origin_tasks(["origin-1"])) == {("default", owner): "ok", ("default", child): "ok"}
++    worker_store = SessionDB(db_path=named / "state.db")
++    try:
++        assert worker_store.list_meta_prefix("kanban_origin:") == []
++    finally:
++        worker_store.close()
++
++
++def test_subscription_for_a_missing_profile_never_falls_back_to_default(homes):
++    default, _ = homes
++    seed_sessions(default, "s-9")
++    with kbc.connect_closing() as conn:
++        task = kb.create_task(conn, title="t", session_id="s-9")
++        kbn.add_notify_sub(conn, task_id=task, platform="tui", chat_id="s-9", notifier_profile="ghost")
++        # The task's own stamp still links by association, but nothing was INDEXED for it.
++    assert origin_tasks(["s-9"])["refs"] == []
++
++    with kbc.connect_closing() as conn:
++        kbn.add_notify_sub(conn, task_id=task, platform="tui", chat_id="s-9", notifier_profile="default")
++    assert linked(origin_tasks(["s-9"])) == {("default", task): "ok"}
+diff --git a/tests/plugins/test_kanban_origin_tasks.py b/tests/plugins/test_kanban_origin_tasks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3630ad59fec73c38b15d845f8179b235d379d27
+--- /dev/null
++++ b/tests/plugins/test_kanban_origin_tasks.py
+@@ -0,0 +1,325 @@
++"""GET /origin-tasks: the desktop's batched, profile-scoped origin lookup.
++
++Same router-on-bare-FastAPI harness as the other kanban plugin tests. Boards are driven by the REAL
++producers (``claim_task``, ``heartbeat_worker``, ``_set_worker_pid`` — including its real process
++fingerprint), then read back through the route: activity must come from the current run's evidence,
++never from a bare claim, a fingerprint mistaken for a time, or an earlier run's heartbeat.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import importlib.util
++import os
++import sys
++import time
++from pathlib import Path
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli.kanban_origin import MAX_SEED_SESSIONS, origin_key
++from hermes_state import SessionDB
++
++URL = "/api/plugins/kanban/origin-tasks"
++
++
++def _router():
++    plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
++    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_kanban_origin_test", plugin_file)
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    return mod.router
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_HOME"):
++        monkeypatch.delenv(var, raising=False)
++    kb.init_db()
++    state = SessionDB(db_path=home / "state.db")
++    state.create_session("origin", source="cli")
++    state.close()
++    return home
++
++
++@pytest.fixture
++def api(home):
++    app = FastAPI()
++    app.include_router(_router(), prefix="/api/plugins/kanban")
++    return TestClient(app)
++
++
++def _linked(conn, title="t"):
++    """A ready task the origin session ordered and is subscribed to (so the producer indexed it)."""
++    task = kb.create_task(conn, title=title, assignee="default", session_id="origin")
++    kbn.add_notify_sub(conn, task_id=task, platform="tui", chat_id="origin", notifier_profile="default")
++    return task
++
++
++def _activity(api):
++    body = api.get(URL, params={"session_ids": "origin"}).json()
++    return {r["task_id"]: (r["task"]["activity"], r["task"]["activity_evidence"]) for r in body["refs"]}
++
++
++def test_activity_comes_from_the_current_runs_evidence(api):
++    with kbc.connect_closing() as conn:
++        spawned, beating, reserved, reclaimed, skewed = (_linked(conn, n) for n in "abcde")
++        for task in (spawned, beating, reserved, reclaimed, skewed):
++            assert kb.claim_task(conn, task) is not None  # opens a real run
++
++        kbd._set_worker_pid(conn, spawned, os.getpid())  # real spawn: pid + process fingerprint + event
++        fingerprint = conn.execute(
++            "SELECT worker_started_at FROM task_runs WHERE task_id = ?", (spawned,)).fetchone()[0]
++        kbd.heartbeat_worker(conn, beating)
++
++        # An earlier run's heartbeat survives on the task row; its replacement run has no evidence at all.
++        kbd.heartbeat_worker(conn, reclaimed)
++        conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (int(time.time()) - 100, reclaimed))
++        conn.execute("UPDATE task_runs SET ended_at = ?, outcome = 'crashed' WHERE task_id = ?",
++                     (int(time.time()), reclaimed))
++        conn.execute("UPDATE tasks SET status = 'ready', claim_lock = NULL, claim_expires = NULL WHERE id = ?",
++                     (reclaimed,))
++        assert kb.claim_task(conn, reclaimed) is not None
++        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 10, reclaimed))
++
++        # Beats in the future / before the epoch are not evidence.
++        conn.execute("UPDATE task_runs SET last_heartbeat_at = ? WHERE task_id = ?", (int(time.time()) + 9999, skewed))
++        conn.execute("UPDATE tasks SET last_heartbeat_at = -5 WHERE id = ?", (skewed,))
++        conn.commit()
++
++    # worker_started_at is a fingerprint ("<epoch>|<ticks>" / "unverified"), not a timestamp.
++    assert isinstance(fingerprint, str)
++
++    assert _activity(api) == {
++        spawned: ("background", "spawn"),
++        beating: ("background", "heartbeat"),
++        reserved: ("reserved", "claim"),  # a live claim alone is a reservation
++        reclaimed: ("unknown", "none"),  # old heartbeat + expired claim never implies a running worker
++        skewed: ("reserved", "claim"),
++    }
++
++    # Evidence older than the claim window is stale, not running.
++    old = int(time.time()) - 5 * kb._resolve_claim_ttl_seconds()
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE task_runs SET last_heartbeat_at = ? WHERE task_id = ?", (old, beating))
++        conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (old, beating))
++        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'spawned'", (old, spawned))
++        conn.commit()
++
++    stale = _activity(api)
++    assert stale[spawned] == ("stale", "spawn_old")
++    assert stale[beating] == ("stale", "heartbeat_old")
++
++
++def _task(api, task_id):
++    response = api.get(URL, params={"session_ids": "origin"})
++    assert response.status_code == 200
++    return next(r["task"] for r in response.json()["refs"] if r["task_id"] == task_id)
++
++
++def _profile(home, name, label):
++    directory = home if name == "default" else home / "profiles" / name
++    directory.mkdir(parents=True, exist_ok=True)
++    (directory / "profile.yaml").write_text(f"display_name: {label}\n", encoding="utf-8")
++
++
++def test_current_executor_uses_live_run_not_planned_assignee(api, home, monkeypatch):
++    from hermes_cli import profiles
++
++    _profile(home, "worker", "Backend engineer")
++    monkeypatch.setattr(profiles, "list_profiles", lambda **_: pytest.fail("enumerated profiles"))
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++        kb.assign_task(conn, task, "worker")
++        claimed = kb.claim_task(conn, task)
++        assert claimed is not None
++        kbd.heartbeat_worker(conn, task)
++        # An operator's later assignment is a plan, not the profile of the already-open run.
++        conn.execute("UPDATE tasks SET assignee = 'planned' WHERE id = ?", (task,))
++        conn.commit()
++
++    summary = _task(api, task)
++    assert summary["assignee"] == "planned"
++    assert summary["activity"] == "background"
++    assert summary["current_executor"] == {
++        "profile": "worker", "display_name": "Backend engineer", "phase": "execution"}
++
++
++@pytest.mark.parametrize("reviewer", ["worker", "qualityassurance"])
++def test_review_claim_provenance_does_not_leak_to_a_replacement_run(api, home, reviewer, monkeypatch):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    _profile(home, reviewer, "Independent reviewer")
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++        implementer = kb.claim_task(conn, task)
++        kbd.heartbeat_worker(conn, task)  # same-second old beat must not make the next claim healthy
++        assert kb.request_review(conn, task, reviewer=reviewer, expected_run_id=implementer.current_run_id)
++    assert _task(api, task)["current_executor"] is None  # waiting for a reviewer is not executing
++    with kbc.connect_closing() as conn:
++        review = kb.claim_review_task(conn, task)
++        assert review is not None
++    reserved = _task(api, task)
++    assert reserved["activity"] == "reserved"
++    assert reserved["current_executor"] is None
++    with kbc.connect_closing() as conn:
++        kbd.heartbeat_worker(conn, task)
++    reviewing = _task(api, task)
++    assert reviewing["activity"] == "background"
++    assert reviewing["current_executor"] == {
++        "profile": reviewer, "display_name": "Independent reviewer", "phase": "review"}
++    with kbc.connect_closing() as conn:
++        assert kb.complete_task(conn, task, summary="Synthetic work completed", expected_run_id=review.current_run_id)
++        # Reopen as ordinary execution while retaining all old review events.
++        conn.execute("UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?", (task,))
++        conn.commit()
++        replacement = kb.claim_task(conn, task)
++        assert replacement.current_run_id != review.current_run_id
++        kbd.heartbeat_worker(conn, task)
++    assert _task(api, task)["current_executor"]["phase"] == "execution"
++
++
++@pytest.mark.parametrize("state", ["done", "ended", "reserved", "stale", "missing_run"])
++def test_executor_never_upgrades_unconfirmed_execution(api, state):
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++        run = kb.claim_task(conn, task)
++        assert run is not None
++        if state != "reserved":
++            kbd.heartbeat_worker(conn, task)
++        old = int(time.time()) - 5 * kb._resolve_claim_ttl_seconds()
++        mutations = {
++            "ended": [("UPDATE task_runs SET ended_at = ? WHERE id = ?", (int(time.time()), run.current_run_id))],
++            "reserved": [],
++            "stale": [
++                ("UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?", (old, run.current_run_id)),
++                ("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (old, task))],
++            "missing_run": [("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task,))],
++        }
++        if state == "done":
++            assert kb.complete_task(conn, task, summary="Synthetic work completed", expected_run_id=run.current_run_id)
++        else:
++            for sql, params in mutations[state]:
++                conn.execute(sql, params)
++        conn.commit()
++    summary = _task(api, task)
++    assert summary["current_executor"] is None
++    assert summary["activity"] != "background"
++
++
++def test_executor_cannot_borrow_another_tasks_run(api):
++    with kbc.connect_closing() as conn:
++        task, other = _linked(conn), _linked(conn)
++        assert kb.claim_task(conn, task) is not None
++        wrong = kb.claim_task(conn, other)
++        assert wrong is not None
++        kbd.heartbeat_worker(conn, other)
++        conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (wrong.current_run_id, task))
++        conn.commit()
++    summary = _task(api, task)
++    assert summary["current_executor"] is None
++    assert summary["activity"] != "background"
++
++
++@pytest.mark.parametrize("offset, activity", [(0, "reserved"), (1, "background")])
++def test_task_only_heartbeat_must_unambiguously_postdate_claim(api, monkeypatch, offset, activity):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++        assert kb.claim_task(conn, task) is not None
++        # Legacy task-only signal: equal-second may belong to the previous run; later is usable.
++        conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (now + offset, task))
++        conn.commit()
++    monkeypatch.setattr(time, "time", lambda: now + offset)
++    summary = _task(api, task)
++    assert summary["activity"] == activity
++    assert (summary["current_executor"] is not None) == (activity == "background")
++
++
++@pytest.mark.parametrize("metadata", ["missing", "malformed", "cross_home", "cross_profile"])
++def test_executor_label_never_borrows_other_profile_or_home(api, home, tmp_path, metadata):
++    _profile(home, "default", "Do not borrow origin label")
++    if metadata == "malformed":
++        _profile(home, "worker", "temporary")
++        (home / "profiles/worker/profile.yaml").write_text("[invalid yaml", encoding="utf-8")
++    elif metadata.startswith("cross_"):
++        target = tmp_path / "other-home" if metadata == "cross_home" else home / "profiles/other"
++        _profile(target, "default", "Do not borrow target label")
++        directory = home / "profiles/worker"
++        directory.mkdir(parents=True, exist_ok=True)
++        (directory / "profile.yaml").symlink_to(target / "profile.yaml")
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++        kb.assign_task(conn, task, "worker")
++        assert kb.claim_task(conn, task) is not None
++        kbd.heartbeat_worker(conn, task)
++    assert _task(api, task)["current_executor"] == {
++        "profile": "worker", "display_name": None, "phase": "execution"}
++
++
++def test_queue_wait_and_input_states_are_distinct(api):
++    with kbc.connect_closing() as conn:
++        waiting_on = kb.create_task(conn, title="parent", assignee="default")
++        child = _linked(conn, "child")
++        kb.link_tasks(conn, parent_id=waiting_on, child_id=child)
++        blocked = _linked(conn, "blocked")
++        asking = _linked(conn, "asking")
++        done = _linked(conn, "done")
++        for task, cols in ((blocked, "status = 'blocked', block_kind = 'transient'"),
++                           (asking, "status = 'blocked', block_kind = 'needs_input'"),
++                           (done, "status = 'done'")):
++            conn.execute(f"UPDATE tasks SET {cols} WHERE id = ?", (task,))
++        conn.commit()
++
++    assert _activity(api) == {
++        child: ("waiting", "parents"),
++        blocked: ("blocked", "block_kind"),
++        asking: ("needs-input", "block_kind"),
++        done: ("done", "status"),
++    }
++
++
++def test_read_is_side_effect_free_and_tolerates_odd_metadata(api, home):
++    with kbc.connect_closing() as conn:
++        task = _linked(conn)
++    store = SessionDB(db_path=home / "state.db")
++    store.set_meta(origin_key("origin", "default", task), "7")  # a scalar where JSON object was written
++    store.close()
++    before = hashlib.sha256((home / "state.db").read_bytes()).hexdigest()
++
++    body = api.get(URL, params={"session_ids": "origin"}).json()
++
++    assert [(r["task_id"], r["evidence"], r["indexed_at"]) for r in body["refs"]] == [(task, "ok", 0)]
++    assert hashlib.sha256((home / "state.db").read_bytes()).hexdigest() == before
++
++
++def test_unknown_sessions_and_oversized_requests_are_reported_not_dropped(api):
++    ids = ["origin", "not-in-this-profile"] + [f"x{n}" for n in range(MAX_SEED_SESSIONS)]
++
++    body = api.get(URL, params={"session_ids": ",".join(ids)}).json()
++
++    assert body["truncated"]["sessions"] is True
++    assert "not-in-this-profile" in body["unknown_sessions"]
++    assert body["refs"] == []
++
++
++def test_an_unreadable_store_is_an_error_never_an_empty_list(api, home):
++    (home / "state.db").write_bytes(b"this is not a sqlite database" * 64)
++    for sidecar in ("-wal", "-shm"):
++        (home / f"state.db{sidecar}").unlink(missing_ok=True)
++
++    response = api.get(URL, params={"session_ids": "origin"})
++
++    assert response.status_code >= 500
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index c8b64c095c30a5d8f599869cace132d47d05654e..2772c5ed9ad47dcd3582100f198d6cfe7010ba1e 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1150,8 +1150,14 @@ def _handle_create(args: dict, **kw) -> str:
+         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
+         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+-        return _ok(task_id=new_tid, **landed, **gate,
+-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
++        subscribed = _maybe_auto_subscribe(conn, new_tid)
++        # Index AFTER subscribing so inherited and fresh tui subscriptions are both on the row. A session id
++        # taken from the worker's own task was not verified in this (worker) profile's store.
++        from hermes_cli import kanban_origin
++        kanban_origin.index_created_task(
++            conn, new_tid, session_id=session_id,
++            inherited_session=bool(self_task and session_id == self_task.session_id))
++        return _ok(task_id=new_tid, **landed, **gate, subscribed=subscribed)
+ 
+ 
+ def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 0a5555bdfdc4e1a19d7456c9804b2dba719b2927..5a81e4062ccfa4804a37e0ec3fab5a317a146b0a 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1131,6 +1131,18 @@ Built-in decomposition also inherits its root's durable session. Session lineage
+ `session_id` does not replace existing subscriptions; use `notify-subscribe` and
+ `notify-unsubscribe` to change where events are delivered.
+ 
++**Origin index (desktop session view).** So the Desktop can show a conversation the tasks it ordered —
++across boards, after the turn ended — without scanning boards, `kanban_create` and `tui` subscriptions
++(`notify-subscribe --platform tui`) also write one small reference per `(session, board, task)` into the
++owning profile's `state.db` (`state_meta`, key prefix `kanban_origin:`). It is a navigation index only: the
++board stays authoritative, and `GET /api/plugins/kanban/origin-tasks` re-opens just the indexed boards
++(read-only) and re-verifies each reference before reporting it. A worker-created task is indexed under the
++profile its inherited subscription names, never the worker's. Indexing is best-effort and never affects
++creation. Tasks created before the index existed are not discovered and nothing backfills them;
++re-running `notify-subscribe --platform tui` for such a task indexes it. Tasks created through the CLI or
++dashboard (no session), through decomposition, or on a board file outside the standard board layout
++(custom `HERMES_KANBAN_DB`) are not indexed. A missing reference means "not known", never "idle".
++
+ A chat-originated auto-subscribe is created in `notify+wake` mode: on a terminal event the destination agent both receives the passive message **and** takes a real turn, so it can read the board context and reply in its own voice. See [Delivery modes](#delivery-modes) below.
+ 
+ ### Output truncation in messaging

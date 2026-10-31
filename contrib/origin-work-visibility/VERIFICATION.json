@@ -1,0 +1,48 @@
+{
+  "purpose": "Existing PR132544 patch artifacts; not an implementation branch or installed runtime",
+  "original_pr": 132544,
+  "original_author": "richardhowes",
+  "original_pr_head": "c5b236e4b2915b88c9c76009970d63462c64a1e1",
+  "base_main": "c419cf7c864ac0ee511dbd9f7091a8bba0b567ee",
+  "tested_source_commit": "0bcccbee4f3320d006e4636d7ea050009b1b7001",
+  "tested_source_tree": "da0a53e3b5ac7b48dbb81c4f3ed639447c04fea1",
+  "changed_source_leaves": 33,
+  "executed_independent_checks": {
+    "frontend_unique_tests": 39,
+    "native_python_unique_tests": 27,
+    "additional_API_assertions": 8,
+    "real_source_Chromium_assertions": 13,
+    "official_native": {
+      "checks": 14,
+      "exit": 0,
+      "health_blocking": 0,
+      "health_advisory": 0
+    },
+    "full_noEmit_exit": 0,
+    "read_only_lint_exit": 0,
+    "cohorts_must_not_be_summed": true
+  },
+  "patches": {
+    "origin-main-composition.patch": {
+      "base": "c419cf7c864ac0ee511dbd9f7091a8bba0b567ee",
+      "forward_tree": "da0a53e3b5ac7b48dbb81c4f3ed639447c04fea1",
+      "reverse_tree": "09d554d0358e0812ed48d6c0901609df3a68908c",
+      "bytes": 174250,
+      "sha256": "7df0af340dd3d7df3cbe79cc3549e30c1724901f4e2e64c9cbeb51997b57d804"
+    },
+    "author-followup.patch": {
+      "base": "991393f8f8500f3d8bf71f73d276b36117798b64",
+      "forward_tree": "da0a53e3b5ac7b48dbb81c4f3ed639447c04fea1",
+      "reverse_tree": "556c7667059bff26c05f8fafb35b5412c532aaba",
+      "bytes": 47490,
+      "sha256": "996605baa9bdbe7d76049456905af467557df99b25c13e3ea3bbae2d4333ff15"
+    }
+  },
+  "scope_limits": {
+    "live_dispatcher": false,
+    "live_models": false,
+    "installed_Electron_Windows": false,
+    "upstream_CI_claim": false,
+    "merged_or_released": false
+  }
+}
