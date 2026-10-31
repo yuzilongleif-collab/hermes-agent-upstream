@@ -12,12 +12,18 @@
  * transcript refresh.
  */
 
+import type { SessionInfo } from '@/hermes'
 import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
 import type { SessionMessage, SessionResumeResult } from '@/types/hermes'
 
 import { reconcilePersistedLiveTurn } from './persisted-live-turn'
 import { turnSettledSince } from './settled-turns'
-import { appendLiveSessionProjection, reconcileDurableHistory } from './utils'
+import {
+  appendLiveSessionProjection,
+  overlayConcurrentMessageChanges,
+  reconcileDurableHistory,
+  sessionShouldHaveTranscript
+} from './utils'
 
 /**
  * Whether a re-resume of the chat on screen must keep the live transcript: a
@@ -64,6 +70,43 @@ export function reconcileAuthoritativeMessages(
     liveProjection,
     authoritativeMessages
   )
+}
+
+// "Should have a transcript" is not the cached sessions-list row alone.
+// That row is a cache of backend truth and lags the two flows that
+// report a vanished thread: after a wake/reconnect the list can still
+// carry the respawned backend's session at message_count 0, and a
+// compression tip can show 0 rows while the stored transcript is
+// intact. Conditioning the latch on it alone paints a blank thread
+// UNLATCHED — no retry, no error, just an empty chat that looks like
+// lost history. The resume RPC is authoritative and always reports the
+// stored size (`message_count`, filled from state.db even when
+// `messages_omitted`), so treat it — and a non-empty REST page — as the
+// other rungs of the same ladder.
+export function resumeExpectsTranscript(
+  stored: SessionInfo | undefined,
+  resumed: Pick<SessionResumeResult, 'message_count'>,
+  prefetched: { messages: SessionMessage[] } | null
+): boolean {
+  return sessionShouldHaveTranscript(stored) || (resumed.message_count || 0) > 0 || Boolean(prefetched?.messages.length)
+}
+
+/** Consume the latest runtime prefix before an id-only overlay can restore folded tools. */
+export function reconcileRuntimeMessageChanges(
+  preferred: ChatMessage[],
+  baseline: ChatMessage[],
+  current: ChatMessage[],
+  projection: SessionResumeResult,
+  transcript: ChatMessage[] | null,
+  prefetched: { messages: SessionMessage[] } | null,
+  matchesSession: boolean
+): ChatMessage[] {
+  const turn =
+    matchesSession && transcript && prefetched
+      ? reconcilePersistedLiveTurn(transcript, current, prefetched.messages, projection, baseline)
+      : null
+
+  return turn ?? overlayConcurrentMessageChanges(preferred, baseline, current)
 }
 
 /** Session-state patch for a restored blocking prompt row; the first non-null projection is used. */

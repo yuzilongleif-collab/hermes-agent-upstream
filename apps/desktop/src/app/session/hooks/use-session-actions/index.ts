@@ -135,12 +135,7 @@ import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos, restoreSessionTodosFromSnapshot } from '@/store/todos'
 import { dropTranscriptTail, dropTranscriptTailEverywhere, saveTranscriptTail } from '@/store/transcript-tail-cache'
 import { isWatchWindow } from '@/store/windows'
-import type {
-  SessionCreateResponse,
-  SessionMessagesResponse,
-  SessionResumeResult,
-  UsageStats
-} from '@/types/hermes'
+import type { SessionCreateResponse, SessionMessagesResponse, SessionResumeResult, UsageStats } from '@/types/hermes'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -186,7 +181,9 @@ import {
   liveTurnSettledDuringResume,
   reconcileAuthoritativeChatMessages,
   reconcileAuthoritativeMessages,
-  resumedStreamTarget
+  reconcileRuntimeMessageChanges,
+  resumedStreamTarget,
+  resumeExpectsTranscript
 } from './resume-reconcile'
 import { backgroundRuntimeOptions, runtimeOwner, runtimeOwnerProfile } from './runtime-owner'
 import { createGatewaySession, desktopSessionCreateParams } from './session-create-request'
@@ -2059,7 +2056,12 @@ export function useSessionActions({
             : viewMessagesForReconcile()
 
           // Tail page + previously backfilled prefix (same-session re-resume).
-          prefetchedPage = await graftTranscriptPage(prefetchedResult, previousMessages, storedSessionId, sessionRestScope)
+          prefetchedPage = await graftTranscriptPage(
+            prefetchedResult,
+            previousMessages,
+            storedSessionId,
+            sessionRestScope
+          )
           prefetchedTranscriptMessages = prefetchedPage.transcript
           localSnapshot = prefetchedPage.snapshot
           prefetchApplied = true
@@ -2153,22 +2155,15 @@ export function useSessionActions({
         const currentRuntimeMessages =
           sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages ?? resumeRuntimeBaselineMessages
 
-        // Like warm activation, consume the latest runtime prefix against the
-        // persisted turn before an id-only overlay can resurrect folded tools.
-        const currentLiveTurn =
-          prefetchMatchesResumedSession && prefetchedTranscriptMessages && prefetchedResult
-            ? reconcilePersistedLiveTurn(
-                prefetchedTranscriptMessages,
-                currentRuntimeMessages,
-                prefetchedResult.messages,
-                resumed,
-                resumeRuntimeBaselineMessages
-              )
-            : null
-
-        const preferredWithRuntimeChanges =
-          currentLiveTurn ??
-          overlayConcurrentMessageChanges(preferredMessages, resumeRuntimeBaselineMessages, currentRuntimeMessages)
+        const preferredWithRuntimeChanges = reconcileRuntimeMessageChanges(
+          preferredMessages,
+          resumeRuntimeBaselineMessages,
+          currentRuntimeMessages,
+          resumed,
+          prefetchedTranscriptMessages,
+          prefetchedResult,
+          prefetchMatchesResumedSession
+        )
 
         // #70449: same stale-snapshot guard as the warm path — a turn that
         // started while the resume RPC was in flight has already marked the
@@ -2213,21 +2208,7 @@ export function useSessionActions({
         // is safer than surfacing the in-flight turn alone). Recovery only
         // ever appends, so this matches the final transcript's emptiness.
         //
-        // "Should have a transcript" is not the cached sessions-list row alone.
-        // That row is a cache of backend truth and lags the two flows that
-        // report a vanished thread: after a wake/reconnect the list can still
-        // carry the respawned backend's session at message_count 0, and a
-        // compression tip can show 0 rows while the stored transcript is
-        // intact. Conditioning the latch on it alone paints a blank thread
-        // UNLATCHED — no retry, no error, just an empty chat that looks like
-        // lost history. The resume RPC is authoritative and always reports the
-        // stored size (`message_count`, filled from state.db even when
-        // `messages_omitted`), so treat it — and a non-empty REST page — as the
-        // other rungs of the same ladder.
-        const saidToHaveTranscript =
-          sessionShouldHaveTranscript(stored) ||
-          (resumed.message_count || 0) > 0 ||
-          Boolean(prefetchedResult?.messages.length)
+        const saidToHaveTranscript = resumeExpectsTranscript(stored, resumed, prefetchedResult)
 
         if (saidToHaveTranscript && preferredMessages.length === 0) {
           // Roll back a provisional cached-tail paint and drop its entry: the

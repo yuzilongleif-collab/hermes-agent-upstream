@@ -31,6 +31,26 @@ interface PersistedTurn {
   messages: ChatMessage[]
 }
 
+/** Source-row identity and rendered occurrences must agree before subtracting raw text. */
+function commentaryWasPainted(row: SessionMessage, texts: string[], messages: ChatMessage[]): boolean {
+  const id = rowId(row)
+  // MEDIA rendering and folding change lengths. Equal prose alone is not coverage.
+  const rendered = texts.map(text => renderedText(text).trim()).filter(Boolean)
+
+  const painted = messages.flatMap(message =>
+    message.parts.flatMap(part =>
+      part.type === 'text' && part.sourceRowId === id && part.text.trim() ? [part.text.trim()] : []
+    )
+  )
+
+  return (
+    id !== undefined &&
+    rendered.length > 0 &&
+    painted.length === rendered.length &&
+    rendered.every((text, index) => text === painted[index])
+  )
+}
+
 /** Validate the current turn's source rows against the occurrences actually painted. */
 function candidateTurn(
   rows: SessionMessage[],
@@ -75,24 +95,7 @@ function candidateTurn(
         continue
       }
 
-      const id = rowId(row)
-
-      // MEDIA rendering and folding change lengths. Only source-row provenance,
-      // not equal prose elsewhere in the transcript, proves display coverage.
-      const rendered = texts.map(text => renderedText(text).trim()).filter(Boolean)
-
-      const painted = turnMessages.flatMap(message =>
-        message.parts.flatMap(part =>
-          part.type === 'text' && part.sourceRowId === id && part.text.trim() ? [part.text.trim()] : []
-        )
-      )
-
-      if (
-        id === undefined ||
-        !rendered.length ||
-        painted.length !== rendered.length ||
-        rendered.some((text, index) => text !== painted[index])
-      ) {
+      if (!commentaryWasPainted(row, texts, turnMessages)) {
         return null
       }
 
@@ -206,6 +209,44 @@ function snapshotIntervals(inflight: NonNullable<SessionResumeResult['inflight']
   )
 }
 
+/** Snapshot text and completion timing choose the live remainder, not cache age alone. */
+function projectSnapshotInterval(
+  text: string,
+  inflight: NonNullable<SessionResumeResult['inflight']>,
+  sessionId: string,
+  index: number,
+  final: boolean,
+  localTerminal?: ChatMessage,
+  snapshotBaseline?: ChatMessage[]
+): ChatMessage[] {
+  const error = final ? inflight.error?.trim() : undefined
+
+  // Only a completion observed after this snapshot can overrule streaming.
+  // An already-completed cache row must not settle a later real turn.
+  const completedSinceSnapshot = Boolean(
+    final &&
+    snapshotBaseline &&
+    localTerminal?.role === 'assistant' &&
+    !localTerminal.pending &&
+    !localTerminal.interim &&
+    localTerminal.completedAt !== undefined &&
+    snapshotBaseline.find(message => message.id === localTerminal.id)?.completedAt !== localTerminal.completedAt
+  )
+
+  return text.trim() || (final && !completedSinceSnapshot)
+    ? [
+        {
+          id: final ? `assistant-stream-${sessionId}` : `inflight-assistant-segment-${index}-${sessionId}`,
+          role: 'assistant',
+          parts: text.trim() ? [assistantTextPart(text)] : [],
+          pending: final && Boolean(inflight.streaming) && !completedSinceSnapshot,
+          ...(!final ? { interim: true } : {}),
+          ...(error ? { error, errorSurface: parseErrorSurface(inflight.error_surface) ?? undefined } : {})
+        }
+      ]
+    : []
+}
+
 /**
  * Reconcile the anchored partial turn before role-ordinal pairing sees it.
  * Missing provenance takes the legacy path without subtracting any snapshot text.
@@ -273,36 +314,16 @@ export function reconcilePersistedLiveTurn(
     const text = unrepresentedText(snapshots[index], raw)
 
     const final = index === snapshots.length - 1
-    const error = final ? inflight.error?.trim() : undefined
-    const localTerminal = pairedLocal ? cached.intervals[index]?.at(-1) : undefined
 
-    // Only a completion observed after this snapshot can overrule streaming.
-    // An already-completed cache row must not settle a later real turn.
-    const completedSinceSnapshot = Boolean(
-      final &&
-      snapshotBaseline &&
-      localTerminal?.role === 'assistant' &&
-      !localTerminal.pending &&
-      !localTerminal.interim &&
-      localTerminal.completedAt !== undefined &&
-      snapshotBaseline.find(message => message.id === localTerminal.id)?.completedAt !== localTerminal.completedAt
+    const projected = projectSnapshotInterval(
+      text,
+      inflight,
+      projection.session_id,
+      index,
+      final,
+      pairedLocal ? cached.intervals[index]?.at(-1) : undefined,
+      snapshotBaseline
     )
-
-    const projected: ChatMessage[] =
-      text.trim() || (final && !completedSinceSnapshot)
-        ? [
-            {
-              id: final
-                ? `assistant-stream-${projection.session_id}`
-                : `inflight-assistant-segment-${index}-${projection.session_id}`,
-              role: 'assistant',
-              parts: text.trim() ? [assistantTextPart(text)] : [],
-              pending: final && Boolean(inflight.streaming) && !completedSinceSnapshot,
-              ...(!final ? { interim: true } : {}),
-              ...(error ? { error, errorSurface: parseErrorSurface(inflight.error_surface) ?? undefined } : {})
-            }
-          ]
-        : []
 
     const coveredTools = new Map<ChatMessagePart, ChatMessagePart>()
     const local = pairedLocal ? withoutCoveredAssistantPrefix(durable, cached.intervals[index] ?? [], coveredTools) : []
