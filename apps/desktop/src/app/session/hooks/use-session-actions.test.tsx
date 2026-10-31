@@ -4526,7 +4526,8 @@ describe('resumeSession warm-cache mapping integrity', () => {
               reasoning,
               multipleCommentary,
               completeBeforeRest,
-              sealedBeforeRest: false
+              sealedBeforeRest: false,
+              emptySnapshot: false
             }))
           )
         )
@@ -4537,14 +4538,26 @@ describe('resumeSession warm-cache mapping integrity', () => {
           reasoning: 'matching' as const,
           multipleCommentary: false,
           completeBeforeRest: false,
-          sealedBeforeRest: true
+          sealedBeforeRest: true,
+          emptySnapshot: false
         }))
       )
+      .concat(
+        (['cold', 'warm'] as const).flatMap(mode =>
+          (['matching', 'segmented'] as const).map(reasoning => ({
+            mode, reasoning, multipleCommentary: false, completeBeforeRest: false,
+            sealedBeforeRest: false, emptySnapshot: true
+          }))
+        )
+      )
   )(
-    'does not duplicate a running Codex tool block during $mode history refresh with $reasoning live reasoning (multiple commentary: $multipleCommentary, complete before REST: $completeBeforeRest, sealed before REST: $sealedBeforeRest)',
-    async ({ mode, reasoning, multipleCommentary, completeBeforeRest, sealedBeforeRest }) => {
+    'does not duplicate a running Codex tool block during $mode history refresh with $reasoning live reasoning (multiple commentary: $multipleCommentary, complete before REST: $completeBeforeRest, sealed before REST: $sealedBeforeRest, empty snapshot: $emptySnapshot)',
+    async ({ mode, reasoning, multipleCommentary, completeBeforeRest, sealedBeforeRest, emptySnapshot }) => {
       const sid = 'rt-A'
-      const commentary = 'I will compare isolated frontend and backend worktrees.'
+
+      const commentary = emptySnapshot
+        ? 'Inspecting an isolated synthetic sample.\n\nThe public update must occur once while completed tool output remains available.'
+        : 'I will compare isolated frontend and backend worktrees.'
 
       const comments = multipleCommentary
         ? [commentary, 'The two delegates will use separate directories.']
@@ -4636,7 +4649,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
             messages_omitted: true,
             running: true,
             info: {},
-            inflight: { user: prompt, assistant: publicText, streaming: true }
+            inflight: { user: prompt, assistant: emptySnapshot ? '' : publicText, streaming: true }
           }) as never
       )
 
