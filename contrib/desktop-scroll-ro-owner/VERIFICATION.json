@@ -1,0 +1,125 @@
+{
+  "purpose": "two bounded scroll source regressions; complete tested recovery; no installed-client claim",
+  "owning_issue": 128468,
+  "related_reader_ownership_PR": 137886,
+  "tested_source_commit": "44a94bcb7b13fe9810b66cec310e149f90a8f236",
+  "tested_source_tree": "81ed262369d99d48f2629f8ce1a0eb86e19cd296",
+  "official_base_commit": "016b76da3a8a88e28775e08b6ca2846f471b8eda",
+  "official_base_tree": "ff68247d5204fa6edbd8839b055c541e9906d09a",
+  "accepted_prerequisite": {
+    "original_PR": 132913,
+    "original_author": "Oidaladn0",
+    "implementation_commit": "b0a39665b41a2e6497ef09e1f831dd7eec852798",
+    "source_test_leaves": 11,
+    "all_export_paths": 13,
+    "not_counted_as_new_scroll_work": true
+  },
+  "scroll_unit": {
+    "all_paths": 7,
+    "production_paths": 1,
+    "review_patch_paths": 3,
+    "payload_sha256": {
+      "apps/desktop/scroll-probe.html": "0eb9618f2355d919c82d14f19044c370c0f5dd2b85cc8fc800d6e72ae1b8093a",
+      "apps/desktop/src/components/assistant-ui/thread/list-session-resize-owner.test.tsx": "d87b4f6e69461c37b5a2e80b30465480530bcc16219d7acc2f1347780921b4da",
+      "apps/desktop/src/components/assistant-ui/thread/list-stream-resize-order.test.tsx": "d20230e42b7b923762df56eb766901c1de4d2468c8ca8dbc524838cf454e23e3",
+      "apps/desktop/src/components/assistant-ui/thread/list.tsx": "41982bf3956dec177f617e3e6b4417d74e0acb38ce2a0e42ab1028e56749e14e",
+      "apps/desktop/src/test/scroll-continuity/fixture.tsx": "315eae97ab9fbd47986d86238001a325a4f4328061d5ac9bdb29012fae5960bc",
+      "contrib/scroll-continuity/README.md": "60d7b339d60f223f8386c4fe09fcd97ef0e8b59806a6ed61cff4b86b38cdeea2",
+      "contrib/scroll-continuity/browser.mjs": "daa0f25d70802e1b203b5dc29d51ec766f3c6a481382be6c5389e69b9dbca825"
+    }
+  },
+  "patches": {
+    "complete-public-base.patch": {
+      "bytes": 126131,
+      "sha256": "4f7122dbb75a4cd7e42b472790ef2d3fb93ce0940d819015b277b34bfcbc2c26"
+    },
+    "accepted-reconcile-prerequisite.patch": {
+      "bytes": 83730,
+      "sha256": "f1819504da37964199afbcec4a15bfc7267e960121c0677486845c9d46c7d013"
+    },
+    "scroll-owner-fix.patch": {
+      "bytes": 12532,
+      "sha256": "572305bfc40ed3bbd602918c116452ee622e1a56b93c641380c738bb1a288303"
+    },
+    "scroll-owner-replay.patch": {
+      "bytes": 42401,
+      "sha256": "e2a050705abe6bbe47c4a2348365a1a19c97a5f94b6ee527f43cbad2988746a3"
+    }
+  },
+  "public_base_complete_recovery": {
+    "base_commit": "016b76da3a8a88e28775e08b6ca2846f471b8eda",
+    "base_tree": "ff68247d5204fa6edbd8839b055c541e9906d09a",
+    "complete_result_tree": "81ed262369d99d48f2629f8ce1a0eb86e19cd296",
+    "tested_candidate_tree": "81ed262369d99d48f2629f8ce1a0eb86e19cd296",
+    "whole_tree_equal_tested": true,
+    "all_scroll_payload_hashes_equal_tested": true,
+    "complete_forward_reverse_reapply": true,
+    "changed_paths": [
+      "apps/desktop/scroll-probe.html",
+      "apps/desktop/src/app/session/hooks/use-session-actions.test.tsx",
+      "apps/desktop/src/app/session/hooks/use-session-actions/cached-commentary-case-repro.test.ts",
+      "apps/desktop/src/app/session/hooks/use-session-actions/commentary-case-repro.test.ts",
+      "apps/desktop/src/app/session/hooks/use-session-actions/commentary-history-refresh.test.tsx",
+      "apps/desktop/src/app/session/hooks/use-session-actions/index.ts",
+      "apps/desktop/src/app/session/hooks/use-session-actions/live-turn-remainder.test.ts",
+      "apps/desktop/src/app/session/hooks/use-session-actions/persisted-live-turn.ts",
+      "apps/desktop/src/app/session/hooks/use-session-actions/resume-reconcile.ts",
+      "apps/desktop/src/app/session/hooks/use-session-actions/test-harness.tsx",
+      "apps/desktop/src/components/assistant-ui/thread/list-session-resize-owner.test.tsx",
+      "apps/desktop/src/components/assistant-ui/thread/list-stream-resize-order.test.tsx",
+      "apps/desktop/src/components/assistant-ui/thread/list.tsx",
+      "apps/desktop/src/lib/chat-messages/coverage.test.ts",
+      "apps/desktop/src/lib/chat-messages/coverage.ts",
+      "apps/desktop/src/test/scroll-continuity/fixture.tsx",
+      "contrib/desktop-commentary-f301/README.md",
+      "contrib/desktop-commentary-f301/replay-payload.zip",
+      "contrib/scroll-continuity/README.md",
+      "contrib/scroll-continuity/browser.mjs"
+    ],
+    "changed_leaves": 20,
+    "complete_patch_sha256": "4f7122dbb75a4cd7e42b472790ef2d3fb93ce0940d819015b277b34bfcbc2c26",
+    "metadata_index_proof_only": true,
+    "unrelated_promised_blobs_not_materialized": true,
+    "native_write_tree_missing_ok_for_promised_nonpayload_blobs": true,
+    "no_installed_objects_or_worktree_written": true
+  },
+  "small_review_patch_applicability": {
+    "base_commit": "016b76da3a8a88e28775e08b6ca2846f471b8eda",
+    "source_only_patch_paths": [
+      "apps/desktop/src/components/assistant-ui/thread/list-session-resize-owner.test.tsx",
+      "apps/desktop/src/components/assistant-ui/thread/list-stream-resize-order.test.tsx",
+      "apps/desktop/src/components/assistant-ui/thread/list.tsx"
+    ],
+    "standalone_source_applicability_check": true,
+    "all_changed_blob_hashes_equal_tested": true,
+    "result_tree": "9f722ccb15e046b6963e6c8c615a9657f08c7956",
+    "runtime_tests_executed_without_prerequisite": false
+  },
+  "independent_execution": {
+    "component_store_unique": 81,
+    "original_browser_ids": 17,
+    "additional_owner_browser_ids": 3,
+    "not_summed_as_unique_total": true,
+    "original_base_pair": "main failed4520!=4760 / owner passed",
+    "initial_scroll_candidate_pair": "main passed / owner failed4400!=3600",
+    "final_pair": "both passed",
+    "native_checks": 14,
+    "health_blocking": 0,
+    "health_advisory": 0,
+    "full_noEmit": true,
+    "read_only_ESLint": true,
+    "QA_final_browser_samples": 656,
+    "samples_not_all_asserted_painted": true,
+    "small_patch_not_runtime_retested_without_prerequisite": true
+  },
+  "inspected_later_main": "9a76ac8e4f612c081e12008923893077f10f2ec7",
+  "not_claimed": [
+    "wire reconnect",
+    "NULL display_order persistence",
+    "all scroll symptoms",
+    "installed Windows Electron",
+    "live model/backend",
+    "upstream CI/approval/merge",
+    "runtime adoption"
+  ]
+}

@@ -1,0 +1,698 @@
+diff --git a/apps/desktop/scroll-probe.html b/apps/desktop/scroll-probe.html
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f26b77cf3168939129bfbeeca3a8a410c250735
+--- /dev/null
++++ b/apps/desktop/scroll-probe.html
+@@ -0,0 +1 @@
++<!doctype html><html><head><meta charset="utf-8"><title>Synthetic scroll continuity probe</title></head><body><div id="root"></div><script type="module" src="/src/test/scroll-continuity/fixture.tsx"></script></body></html>
+\ No newline at end of file
+diff --git a/apps/desktop/src/components/assistant-ui/thread/list-session-resize-owner.test.tsx b/apps/desktop/src/components/assistant-ui/thread/list-session-resize-owner.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..41ae8ca196271c44a1e6f408738d7c37505963ee
+--- /dev/null
++++ b/apps/desktop/src/components/assistant-ui/thread/list-session-resize-owner.test.tsx
+@@ -0,0 +1,144 @@
++import { AssistantRuntimeProvider, type ThreadMessage, useAuiState, useExternalStoreRuntime } from '@assistant-ui/react'
++import { act, render } from '@testing-library/react'
++import { expect, it, vi } from 'vitest'
++
++import { rescopeConnectionScopedStores } from '@/lib/connection-scoped'
++import { setActiveProfile } from '@/store/profile'
++import { getThreadScrollPosition, saveThreadScrollPosition } from '@/store/thread-scroll'
++
++import { stubThreadEnvironment, stubThreadViewportSize } from '../test-utils'
++
++import { Thread } from '.'
++
++stubThreadEnvironment()
++stubThreadViewportSize()
++let height = 2000
++Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, get: () => height })
++Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => 600 })
++
++const messages = (key: string, running: boolean): ThreadMessage[] => [
++  {
++    id: `u-${key}`,
++    role: 'user',
++    content: [{ type: 'text', text: `Synthetic task ${key}` }],
++    attachments: [],
++    createdAt: new Date('2026-01-01'),
++    metadata: { custom: {} }
++  },
++  {
++    id: `a-${key}`,
++    role: 'assistant',
++    content: [{ type: 'text', text: `Synthetic answer ${key}` }],
++    status: running ? { type: 'running' } : { type: 'complete', reason: 'stop' },
++    createdAt: new Date('2026-01-01'),
++    metadata: { unstable_state: null, unstable_annotations: [], unstable_data: [], steps: [], custom: {} }
++  }
++]
++
++function RunningMarker() {
++  const running = useAuiState(s => s.thread.isRunning)
++
++  return <output data-running={String(running)} data-testid="runtime-running" />
++}
++
++function Harness({ sessionKey, running }: { sessionKey: string; running: boolean }) {
++  const runtime = useExternalStoreRuntime<ThreadMessage>({
++    messages: messages(sessionKey, running),
++    isRunning: running,
++    onNew: async () => {}
++  })
++
++  return (
++    <AssistantRuntimeProvider runtime={runtime}>
++      <RunningMarker />
++      <Thread sessionId={sessionKey} sessionKey={sessionKey} />
++    </AssistantRuntimeProvider>
++  )
++}
++
++it('QA same mounted Thread preserves saved reading offset when switching from shorter A to running B before native resize', async () => {
++  window.localStorage.clear()
++  setActiveProfile('default')
++  rescopeConnectionScopedStores(null)
++  height = 2000
++  saveThreadScrollPosition('qa-boundary-B', { kind: 'offset', fromBottom: 800 })
++  expect(getThreadScrollPosition('qa-boundary-B')).toEqual({ kind: 'offset', fromBottom: 800 })
++  const original = globalThis.ResizeObserver
++  const observers = new Set<{ callback: ResizeObserverCallback; targets: Set<Element> }>()
++  vi.stubGlobal(
++    'ResizeObserver',
++    class {
++      targets = new Set<Element>()
++      constructor(public callback: ResizeObserverCallback) {
++        observers.add(this)
++      }
++      observe(target: Element) {
++        this.targets.add(target)
++      }
++      unobserve(target: Element) {
++        this.targets.delete(target)
++      }
++      disconnect() {
++        this.targets.clear()
++      }
++    }
++  )
++  const view = render(<Harness running={false} sessionKey="qa-boundary-A" />)
++  const viewport = view.container.querySelector<HTMLElement>('[data-slot="aui_thread-viewport"]')!
++
++  try {
++    await act(async () => {
++      for (let tick = 0; tick < 10; tick++) {
++        await new Promise(r => setTimeout(r, 0))
++      }
++    })
++    expect(viewport.scrollTop).toBe(1400)
++    const frame = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation(() => 0)
++
++    try {
++      height = 5000
++      view.rerender(<Harness running sessionKey="qa-boundary-B" />)
++      // The external-store runtime publishes updated running state asynchronously.
++      // Keep rAF parked, but require the real consumer to see running=true.
++      await act(async () => {
++        for (let tick = 0; tick < 3; tick++) {
++          await new Promise(r => setTimeout(r, 0))
++        }
++      })
++      expect(view.container.querySelector('[data-testid="runtime-running"]')?.getAttribute('data-running')).toBe('true')
++      const next = view.container.querySelector<HTMLElement>('[data-slot="aui_thread-viewport"]')!
++      expect(next).toBe(viewport) // Prove real DOM/Thread lifecycle reuse.
++      expect(next.scrollTop).toBe(3600) // Restore actually consumed B's saved 800px.
++      const before = next.scrollTop
++      act(() => {
++        next.dispatchEvent(new Event('scroll'))
++
++        for (const observer of observers) {
++          const targets = [...observer.targets].filter(t => t.getAttribute('data-slot') === 'aui_thread-content')
++
++          if (targets.length) {
++            observer.callback(
++              targets.map(target => ({ target, contentRect: { height } })) as ResizeObserverEntry[],
++              observer as unknown as ResizeObserver
++            )
++          }
++        }
++      })
++      console.log(
++        'QA_SESSION_BOUNDARY',
++        JSON.stringify({
++          sameViewport: next === viewport,
++          restoredTop: before,
++          afterResizeTop: next.scrollTop,
++          fromBottom: height - 600 - next.scrollTop
++        })
++      )
++      expect(next.scrollTop).toBe(3600)
++    } finally {
++      frame.mockRestore()
++    }
++  } finally {
++    view.unmount()
++    vi.stubGlobal('ResizeObserver', original)
++  }
++})
+diff --git a/apps/desktop/src/components/assistant-ui/thread/list-stream-resize-order.test.tsx b/apps/desktop/src/components/assistant-ui/thread/list-stream-resize-order.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..52edf06cef77b264bfc680356e933965f2e46876
+--- /dev/null
++++ b/apps/desktop/src/components/assistant-ui/thread/list-stream-resize-order.test.tsx
+@@ -0,0 +1,93 @@
++import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
++import { act, render } from '@testing-library/react'
++import { expect, it, vi } from 'vitest'
++
++import { stubThreadEnvironment, stubThreadViewportSize } from '../test-utils'
++
++import { Thread } from '.'
++
++stubThreadEnvironment()
++stubThreadViewportSize()
++
++const CLIENT_HEIGHT = 600
++let contentHeight = 5000
++
++Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, get: () => contentHeight })
++Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => CLIENT_HEIGHT })
++
++const createdAt = new Date('2026-01-01T00:00:00Z')
++
++const messages: ThreadMessage[] = [
++  { id: 'scroll-order-user', role: 'user', content: [{ type: 'text', text: 'Synthetic task' }], attachments: [], createdAt, metadata: { custom: {} } },
++  { id: 'scroll-order-assistant', role: 'assistant', content: [{ type: 'text', text: 'Synthetic streaming response' }], status: { type: 'running' }, createdAt, metadata: { unstable_state: null, unstable_annotations: [], unstable_data: [], steps: [], custom: {} } }
++]
++
++function Harness() {
++  const runtime = useExternalStoreRuntime<ThreadMessage>({ messages, isRunning: true, onNew: async () => {} })
++
++  return <AssistantRuntimeProvider runtime={runtime}><Thread sessionId="scroll-order-runtime" sessionKey="scroll-order" /></AssistantRuntimeProvider>
++}
++
++it('keeps the pre-growth resize baseline when the previous pin scroll event arrives before the next resize', async () => {
++  contentHeight = 5000
++  const original = globalThis.ResizeObserver
++  const observers = new Set<{ callback: ResizeObserverCallback; targets: Set<Element> }>()
++
++  vi.stubGlobal('ResizeObserver', class {
++    targets = new Set<Element>()
++    constructor(public callback: ResizeObserverCallback) { observers.add(this) }
++    observe(target: Element) { this.targets.add(target) }
++    unobserve(target: Element) { this.targets.delete(target) }
++    disconnect() { this.targets.clear() }
++  })
++
++  const { container, unmount } = render(<Harness />)
++  const viewport = container.querySelector<HTMLElement>('[data-slot="aui_thread-viewport"]')!
++
++  const resize = () => {
++    for (const observer of observers) {
++      const targets = [...observer.targets].filter(node => node.getAttribute('data-slot') === 'aui_thread-content')
++
++      if (targets.length) {
++        observer.callback(targets.map(target => ({ target, contentRect: { height: contentHeight } })) as ResizeObserverEntry[], observer as unknown as ResizeObserver)
++      }
++    }
++  }
++
++  try {
++    await act(async () => {
++      for (let tick = 0; tick < 10; tick++) {await new Promise(resolve => setTimeout(resolve, 0))}
++    })
++    expect(viewport.scrollTop).toBe(contentHeight - CLIENT_HEIGHT)
++    // Isolate the synchronous before-paint pin from the library's next rAF.
++    const frame = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation(() => 0)
++
++    try {
++      act(() => { contentHeight += 120; resize() })
++      expect(viewport.scrollTop).toBe(contentHeight - CLIENT_HEIGHT)
++
++      // A scroll event caused by that pin can be delivered after the next DOM
++      // growth but before its ResizeObserver. It is not a fresh resize sample.
++      act(() => {
++        contentHeight += 240
++        viewport.dispatchEvent(new Event('scroll'))
++        resize()
++      })
++      expect(viewport.scrollTop).toBe(contentHeight - CLIENT_HEIGHT)
++
++      // A genuine reader escape must still win over the same resize ordering.
++      const readingTop = viewport.scrollTop - 900
++      act(() => {
++        viewport.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -160 }))
++        viewport.scrollTop = readingTop
++        viewport.dispatchEvent(new Event('scroll'))
++        contentHeight += 400
++        resize()
++      })
++      expect(viewport.scrollTop).toBe(readingTop)
++    } finally { frame.mockRestore() }
++  } finally {
++    unmount()
++    vi.stubGlobal('ResizeObserver', original)
++  }
++})
+diff --git a/apps/desktop/src/components/assistant-ui/thread/list.tsx b/apps/desktop/src/components/assistant-ui/thread/list.tsx
+index 31fe6b5a9cf6fc718ff6a0cd756aefe9e8c79856..7a056fcd8ff989a50c2d15f6a5ed73cf9c0db197 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/list.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/list.tsx
+@@ -904,8 +904,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
+   // session's live state and must not file it under the new key).
+   const restoredContentKeyRef = useRef<string | null | undefined>(undefined)
+ 
+-  // eslint-disable-next-line no-restricted-syntax -- DOM-event cache (scroll/ResizeObserver callbacks), not an atom mirror
+-  useEffect(() => {
++  // Re-seed at transcript-owner commits, before native RO can treat the incoming session as old-session growth.
++  useLayoutEffect(() => {
+     const el = scrollRef.current
+     const content = contentRef.current
+ 
+@@ -920,13 +920,12 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
+     // paint.
+     const resizeMetrics = () => readThreadScrollResizeMetrics(el, clearanceRef.current)
+ 
+-    // ponytail: previous-metrics precision is load-bearing — the predicate must
+-    // see the frame BEFORE the growth, so a scroll event (which also writes it)
+-    // can't leave a stale gap that makes a mid-stream resize look like growth.
++    // Only ResizeObserver advances the resize baseline. A scroll event from
++    // our previous pin may arrive after new DOM growth but before its observer;
++    // sampling height there would hide that growth from the synchronous pin.
+     let previousResizeMetrics = resizeMetrics()
+ 
+     const update = () => {
+-      previousResizeMetrics = resizeMetrics()
+       liveScrollStateRef.current = threadScrollStateFromMetrics(el)
+     }
+ 
+@@ -962,7 +961,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
+       el.removeEventListener('scroll', update)
+       observer.disconnect()
+     }
+-  }, [contentRef, paneVisible, scrollRef])
++  }, [contentRef, hasGroups, paneVisible, scrollRef, scrollStorageKey, sessionKey])
+ 
+   // Persist the live position on app close, so a reading position survives a
+   // quit without a session switch (the switch cleanup below only runs on
+diff --git a/apps/desktop/src/test/scroll-continuity/fixture.tsx b/apps/desktop/src/test/scroll-continuity/fixture.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..35a65eb2bfad0c570bac3f446749761eb3b2c72f
+--- /dev/null
++++ b/apps/desktop/src/test/scroll-continuity/fixture.tsx
+@@ -0,0 +1,146 @@
++import '@/styles.css'
++
++// Synthetic data only. Production Thread, Markdown, resize observers, scroll owner,
++// runtime conversion and history reconciliation are imported, not reimplemented.
++import { AssistantRuntimeProvider, useAuiState, useExternalStoreRuntime } from '@assistant-ui/react'
++import { type CSSProperties, useCallback, useMemo, useRef, useState } from 'react'
++import { createRoot } from 'react-dom/client'
++
++import { reconcileAuthoritativeChatMessages } from '@/app/session/hooks/use-session-actions/resume-reconcile'
++import { Thread } from '@/components/assistant-ui/thread'
++import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
++import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
++import { toRuntimeMessage } from '@/lib/chat-runtime'
++import { requestScrollToBottom, saveThreadScrollPosition } from '@/store/thread-scroll'
++
++// Schedule the already-observed browser ordering deterministically. Only the
++// pending scroll event is synthetic; message layout and ResizeObserver are real.
++function appendBeforeDelayedScroll(rows: ChatMessage[], append: () => void, delivered: { current: number }) {
++  const target = document.querySelector<HTMLElement>(`[data-message-id="${rows.at(-1)!.id}"]`)!
++  const viewport = target.closest<HTMLElement>('[data-slot="aui_thread-viewport"]')!
++  const before = target.textContent
++
++  const observer = new MutationObserver(() => {
++    if (target.textContent !== before) {
++      observer.disconnect()
++      delivered.current += 1
++      viewport.dispatchEvent(new Event('scroll'))
++    }
++  })
++
++  observer.observe(target, { childList: true, characterData: true, subtree: true })
++  append()
++}
++
++const PROSE = 'Synthetic continuity sample. This is a stable paragraph used to measure a real message, not a private conversation. '
++const TIMESTAMP = 1767225600
++
++function makeMessages(turns = 18, repeats = 5, start = 0): ChatMessage[] {
++  return Array.from({ length: turns }, (_, offset) => {
++    const index = start + offset
++
++    return [
++      { id: `u-${index}`, role: 'user', parts: [{ type: 'text', text: `Synthetic task ${index}` }], rowId: index * 2, timestamp: TIMESTAMP },
++      { id: `a-${index}`, role: 'assistant', parts: [{ type: 'text', text: `Answer ${index}.\n\n${PROSE.repeat(repeats)}` }], rowId: index * 2 + 1, timestamp: TIMESTAMP }
++    ] as ChatMessage[]
++  }).flat()
++}
++
++function extend(row: ChatMessage, count: number): ChatMessage {
++  return { ...row, parts: [{ type: 'text', text: `${chatMessageText(row)}\n\n${PROSE.repeat(count)}` }] }
++}
++
++function RunningMarker() {
++  const running = useAuiState(state => state.thread.isRunning)
++
++  return <output data-runtime-running={String(running)} hidden />
++}
++
++function Probe() {
++  const [rows, setRows] = useState(makeMessages)
++  const [running, setRunning] = useState(false)
++  const [sessionKey, setSessionKey] = useState('synthetic-scroll')
++  const [olderAvailable, setOlderAvailable] = useState(false)
++  const saved = useRef<ChatMessage[]>([])
++  const delayedScrollDelivered = useRef(0)
++  const runtimeRows = useMemo(() => rows.map(toRuntimeMessage), [rows])
++  const runtime = useExternalStoreRuntime({ messages: runtimeRows, isRunning: running, onNew: async () => {} })
++
++  const expandWindow = useCallback(async (before?: () => void) => {
++    await new Promise(resolve => setTimeout(resolve, 100))
++    before?.()
++    setRows(previous => [...makeMessages(3, 5, -3), ...previous])
++    setOlderAvailable(false)
++
++    return true
++  }, [])
++
++  window.probe = {
++    ownerA: () => { setRunning(true); setSessionKey('synthetic-owner-A'); setRows(makeMessages(4, 5, 1000)) },
++    ownerB: () => {
++      saveThreadScrollPosition('synthetic-owner-B', { kind: 'offset', fromBottom: 800 })
++      setRunning(true)
++      setSessionKey('synthetic-owner-B')
++      setRows(makeMessages(4, 5, 2000))
++    },
++    appendBeforeDelayedScroll: () => appendBeforeDelayedScroll(rows, () => setRows(previous => previous.map((row, index) => index === previous.length - 1 ? extend(row, 3) : row)), delayedScrollDelivered),
++    delayedScrollDelivered: () => delayedScrollDelivered.current,
++    append: (count = 3) => setRows(previous => previous.map((row, index) => index === previous.length - 1 ? extend(row, count) : row)),
++    empty: () => { saved.current = rows; setRows([]) },
++    enableHistory: () => setOlderAvailable(true),
++    grow: (rowId: number) => setRows(previous => previous.map(row => row.rowId === rowId ? extend(row, 12) : row)),
++    heavy: () => { setRunning(false); setSessionKey('synthetic-heavy'); setRows(makeMessages(100, 40)) },
++    hydrate: () => setRows(previous => previous.map(row => ({ ...row, parts: [...row.parts] }))),
++    identity: (id: string) => rows.find(row => row.id === id)?.rowId,
++    jump: () => requestScrollToBottom('synthetic-runtime'),
++    nextTurn: () => setRows(previous => [...previous, ...makeMessages(1, 5, previous.length / 2)]),
++    reconcile: () => setRows(previous => reconcileAuthoritativeChatMessages(previous.map(row => ({ ...row, id: `hydrated-${row.rowId}`, parts: [...row.parts] })), previous)),
++    reset: () => { setRunning(false); setSessionKey('synthetic-scroll'); setRows(makeMessages()) },
++    restore: () => setRows(saved.current),
++    rows: () => rows,
++    start: () => setRunning(true),
++    stop: () => setRunning(false)
++  }
++
++  return (
++    <AssistantRuntimeProvider runtime={runtime}>
++      <RunningMarker />
++      <TranscriptWindowProvider value={{ olderAvailable, expandWindow }}>
++        <header style={{ height: 48, padding: 12 }}>SYNTHETIC · real Thread component · no backend / no user data</header>
++        {/* Fixed synthetic row geometry isolates owner changes from deferred Markdown/backfill. */}
++        <style>{'[data-probe-owner="synthetic-owner-A"] [data-slot="aui_message-group"] { min-height: 500px; } [data-probe-owner="synthetic-owner-B"] [data-slot="aui_message-group"] { min-height: 1250px; }'}</style>
++        <div data-chat-surface="" data-probe-owner={sessionKey} style={{ height: 'calc(100vh - 48px)', '--titlebar-height': '0px', '--composer-width': '800px' } as CSSProperties}>
++          <Thread sessionId="synthetic-runtime" sessionKey={sessionKey} />
++        </div>
++      </TranscriptWindowProvider>
++    </AssistantRuntimeProvider>
++  )
++}
++
++declare global {
++  interface Window {
++    probe: {
++      ownerA: () => void
++      ownerB: () => void
++      appendBeforeDelayedScroll: () => void
++      delayedScrollDelivered: () => number
++      append: (count?: number) => void
++      empty: () => void
++      enableHistory: () => void
++      grow: (rowId: number) => void
++      heavy: () => void
++      hydrate: () => void
++      identity: (id: string) => number | undefined
++      jump: () => void
++      nextTurn: () => void
++      reconcile: () => void
++      reset: () => void
++      restore: () => void
++      rows: () => ChatMessage[]
++      start: () => void
++      stop: () => void
++    }
++  }
++}
++
++createRoot(document.getElementById('root')!).render(<Probe />)
+diff --git a/contrib/scroll-continuity/README.md b/contrib/scroll-continuity/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..352e50adc008c128a437923bb9e7ba23f6dca333
+--- /dev/null
++++ b/contrib/scroll-continuity/README.md
+@@ -0,0 +1,23 @@
++# Bounded scroll-continuity probe (synthetic, not installed-client acceptance)
++
++Run from the repository root with existing Desktop workspace dependencies and the matching Playwright headless Chromium already prepared:
++
++```sh
++node contrib/scroll-continuity/browser.mjs /absolute/task-owned/evidence
++```
++
++This uses the **unmodified official Vite configuration**, production Thread/Markdown/CSS, native ResizeObserver/IntersectionObserver and scroll owner, real `reconcileAuthoritativeChatMessages` and `toRuntimeMessage`. The HTML entry is `apps/desktop/scroll-probe.html`. No backend starts, no model is called, and no private conversation/config/database is read. The plain-text snapshot and delayed history-page producer are explicitly synthetic. This does not emulate wire reconnect/ordering or prove Electron/Windows adoption.
++
++Seventeen stable case IDs cover bottom growth, genuine wheel escape, reading anchors, repeated real source reconciliation with durable identities, completion, same-key empty/reload restoration, asynchronous Show-earlier prepend, variable row height after the reader takes ownership, explicit jump/resumed following, a render-budgeted next-turn control, and successive content-resize observer samples reaching the bottom before the next frame. The history button is invoked through its DOM click handler without Playwright scrolling it into view, so the test does not confuse deliberate navigation to the button with preservation of the prior reading anchor.
++
++`frames.json` contains rAF and content-ResizeObserver samples (distinguished by `phase`) with viewport/scrollTop/scrollHeight, following state and on-screen logical rowId/renderer-id/geometry. The observer tracks **outer groups**; it never asks skipped off-screen message descendants for layout. Samples are diagnostic, not proof that every sample was painted. `results.json` contains exact case outcomes and settled snapshots. Raw screenshots are 1440x960. Browser and Vite exit in `finally` on success and failure.
++
++The cold same-key reload first mounts a bounded tail and backfills. Its oracle waits for the remembered logical anchor to become reachable (10-second failure bound), rather than interpreting a fixed one-second in-progress snapshot as settled failure. It does **not** claim zero transient loading displacement. Existing post-restore frozen-distance behavior intentionally preserves from-bottom through late layout until real user input; a genuine wheel gesture precedes the independent variable-height oracle.
++
++The repair is deliberately local: only the content ResizeObserver advances its previous-size baseline. A delayed scroll event caused by the previous bottom pin must not consume the next DOM growth before that growth's ResizeObserver. A natural baseline trace exposed this ordering, while another natural retry did not (it is timing-dependent). The browser fixture therefore has a controlled actor: it appends real text, then delivers one synthetic pending `scroll` from a MutationObserver after that DOM text changes and before the native ResizeObserver. It checks that this actor actually delivered once; no scrollHeight, clientHeight, layout, resize callback or model/backend output is fabricated. The same final browser case is red on baseline and green on the candidate.
++
++`list-stream-resize-order.test.tsx` independently makes that ordering deterministic with the real Thread component under the existing jsdom harness; its geometry/RO are explicit stubs, unlike the browser. It also asserts that genuine wheel escape still wins. The production fix removes one height-sampling assignment from the scroll callback, adds no new owner/state/ordering protocol, and leaves the existing library follow path intact. Its live observer is re-created in a layout effect on session/profile storage-owner changes and empty-to-loaded content: a baseline from a shorter outgoing transcript must not mistake the restored incoming running transcript for stream growth. Rebinding during the commit prevents a native RO from running against an old owner's dimensions before passive effects.
++
++Three additional `owner-switch-*` IDs are a separate cohort, not extra executions of the original seventeen. They use the same mounted viewport/content and a real running-state marker, with synthetic four-row minimum heights of 500px in A and 1250px in B to make incoming geometry available at commit time. This explicit fixture CSS does not claim organic Markdown/backfill timing coverage. A is already running before switching to running B; the colocated `list-session-resize-owner.test.tsx` separately waits for real runtime publication in the idle-A to running-B case. B has a remembered 800px reading gap. A MutationObserver watching the committed owner attribute delivers one synthetic pending scroll before native RO, and the native-RO samples must retain 800px. `owner-frames.json` records same viewport/content identity, actual running state, content height and before/after geometry; dimensions and resize callbacks remain native. On the first candidate without owner rebinding this case is red (800px becomes 0), while the revised candidate stays at 800px. This fixture's fixed-row whitespace is intentional test geometry, not production UI styling.
++
++The inherited commentary-reconciliation patch is separate provenance, not authored by this probe. The original user occurrence and installed Windows client still need their existing QA owner/window; this is not proof of adoption or unique incident attribution.
+diff --git a/contrib/scroll-continuity/browser.mjs b/contrib/scroll-continuity/browser.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c49aa4aa837a31ca75044bb7c3ba9bae0ff3266
+--- /dev/null
++++ b/contrib/scroll-continuity/browser.mjs
+@@ -0,0 +1,213 @@
++import assert from 'node:assert/strict'
++import { mkdirSync, writeFileSync } from 'node:fs'
++import { createRequire } from 'node:module'
++import { resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++const require = createRequire(import.meta.url)
++const { chromium } = require('playwright-core')
++const { createServer } = await import('vite')
++const repo = fileURLToPath(new URL('../..', import.meta.url))
++const output = resolve(process.argv[2] || 'artifacts/scroll-continuity')
++mkdirSync(output, { recursive: true })
++const server = await createServer({ root: resolve(repo, 'apps/desktop'), configFile: resolve(repo, 'apps/desktop/vite.config.ts'), server: { port: 0, strictPort: false }, cacheDir: resolve(repo, 'node_modules/.vite-scroll') })
++const errors = [], results = [], snapshots = []
++let browser, page
++const check = (id, fn) => {
++  try { fn(); results.push({ id, passed: true }); console.log(`PASS ${id}`) }
++  catch (e) { results.push({ id, passed: false, error: String(e) }); console.log(`FAIL ${id}: ${e}`) }
++}
++const idle = async (ms = 300) => page.waitForTimeout(ms)
++const snap = async label => {
++  const s = await page.evaluate(() => window.scrollProbe.measure())
++  snapshots.push({ label, ...s })
++  return s
++}
++const sameAnchor = (before, after) => {
++  const anchor = before.visible.find(row => row.role === 'assistant' && row.top >= 0)
++  assert.ok(anchor, 'expected an on-screen assistant anchor')
++  const next = after.visible.find(row => row.rowId === anchor.rowId)
++  assert.ok(next, `anchor row ${anchor.rowId} survived`)
++  assert.ok(Math.abs(next.top - anchor.top) <= 2, `anchor ${anchor.rowId} moved ${next.top - anchor.top}px`)
++}
++try {
++  await server.listen()
++  browser = await chromium.launch({ headless: true })
++  page = await browser.newPage({ viewport: { width: 1440, height: 960 }, reducedMotion: 'no-preference' })
++  page.on('pageerror', e => errors.push(String(e)))
++  await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/scroll-probe.html`, { timeout: 90000 })
++  await page.waitForSelector('[data-slot="aui_assistant-message-root"]', { timeout: 90000 })
++  await idle(1800)
++  // Observe outer groups. Never measure descendants of skipped/off-screen groups:
++  // that would wake content-visibility and alter the scroll behavior being tested.
++  await page.evaluate(() => {
++    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
++    const visible = new Set(), observed = new Set(), frames = []
++    let label = 'initial', stopped = false, frame
++    const observer = new IntersectionObserver(entries => {
++      for (const entry of entries) entry.isIntersecting ? visible.add(entry.target) : visible.delete(entry.target)
++    }, { root: viewport })
++    const reconcile = () => {
++      for (const group of viewport.querySelectorAll('[data-slot="aui_message-group"]')) {
++        if (!observed.has(group)) { observed.add(group); observer.observe(group) }
++      }
++      for (const group of observed) if (!group.isConnected) { observed.delete(group); visible.delete(group); observer.unobserve(group) }
++    }
++    const mutations = new MutationObserver(reconcile)
++    mutations.observe(viewport, { childList: true, subtree: true })
++    reconcile()
++    const measure = () => {
++      const rect = viewport.getBoundingClientRect()
++      return { top: viewport.scrollTop, height: viewport.scrollHeight, client: viewport.clientHeight, gap: viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop, following: viewport.dataset.following, visible: [...visible].filter(n => n.isConnected).flatMap(group => [...group.querySelectorAll('[data-message-id]')].map(node => ({ id: node.dataset.messageId, rowId: window.probe.identity(node.dataset.messageId), role: node.dataset.slot?.includes('assistant') ? 'assistant' : 'user', top: node.getBoundingClientRect().top - rect.top, bottom: node.getBoundingClientRect().bottom - rect.top }))).filter(row => row.bottom > 0 && row.top < rect.height).sort((a,b) => a.rowId - b.rowId) }
++    }
++    const resizeFrames = []
++    const paintFrontier = new ResizeObserver(() => {
++      queueMicrotask(() => resizeFrames.push({ label, at: performance.now(), phase: 'resize-observer', ...measure() }))
++    })
++    paintFrontier.observe(viewport.querySelector('[data-slot="aui_thread-content"]'))
++    const sample = () => { if (!stopped) { frames.push({ label, at: performance.now(), phase: 'raf', ...measure() }); frame = requestAnimationFrame(sample) } }
++    frame = requestAnimationFrame(sample)
++    window.scrollProbe = { measure, label: value => { label = value }, finish: () => { stopped = true; cancelAnimationFrame(frame); observer.disconnect(); paintFrontier.disconnect(); mutations.disconnect(); return [...frames, ...resizeFrames].sort((a,b) => a.at - b.at) } }
++  })
++  await idle(100)
++  const initial = await snap('loaded')
++  check('initial-bottom', () => assert.ok(Math.abs(initial.gap) <= 2))
++  await page.evaluate(() => { window.scrollProbe.label('stream-bottom'); window.probe.start() })
++  for (let n = 0; n < 6; n++) { await page.evaluate(() => window.probe.append(3)); await idle(35) }
++  await idle(); const bottom = await snap('stream-bottom')
++  check('stream-bottom-follow', () => { assert.ok(Math.abs(bottom.gap) <= 2); assert.equal(bottom.following, 'true') })
++  await page.evaluate(() => { window.scrollProbe.label('ordered-stream-pin'); window.probe.appendBeforeDelayedScroll() })
++  await page.waitForFunction(() => window.probe.delayedScrollDelivered() === 1)
++  await idle(400)
++  await snap('ordered-stream-pin')
++  await page.screenshot({ path: `${output}/bottom.png` })
++  await page.evaluate(() => window.scrollProbe.label('user-wheel'))
++  await page.locator('[data-slot="aui_thread-viewport"]').hover()
++  await page.mouse.wheel(0, -1100); await idle(700)
++  const reading = await snap('reading')
++  check('user-wheel-escapes', () => { assert.ok(reading.gap > 500); assert.equal(reading.following, 'false') })
++  await page.evaluate(() => window.scrollProbe.label('stream-reading'))
++  for (let n = 0; n < 6; n++) { await page.evaluate(() => window.probe.append(3)); await idle(35) }
++  await idle(); const appended = await snap('stream-reading')
++  check('stream-keeps-reading-anchor', () => sameAnchor(reading, appended))
++  await page.evaluate(() => { window.scrollProbe.label('hydrate'); window.probe.hydrate() }); await idle()
++  const hydrated = await snap('hydrate')
++  check('same-identity-hydration', () => sameAnchor(appended, hydrated))
++  await page.evaluate(() => window.scrollProbe.label('reconcile'))
++  for (let n = 0; n < 3; n++) { await page.evaluate(() => window.probe.reconcile()); await idle(150) }
++  const reconciled = await snap('real-source-reconcile')
++  check('repeated-source-reconcile', () => sameAnchor(hydrated, reconciled))
++  check('source-reconcile-no-extra-occurrences', () => assert.equal(reconciled.visible.length, hydrated.visible.length))
++  await page.evaluate(() => window.probe.stop()); await idle()
++  const completed = await snap('complete')
++  check('completion-keeps-reading', () => sameAnchor(reconciled, completed))
++  await page.evaluate(() => { window.scrollProbe.label('empty-reload'); window.probe.empty() }); await idle(100)
++  await page.evaluate(() => window.probe.restore())
++  // A cold same-key restore first paints a bounded tail, then backfills. It is
++  // not a settled reading position until the remembered anchor is reachable.
++  await page.waitForFunction(expected => window.scrollProbe.measure().visible.some(row => row.rowId === expected.rowId && Math.abs(row.top - expected.top) <= 2), completed.visible.find(row => row.role === 'assistant' && row.top >= 0), { timeout: 10000 })
++  await idle(200)
++  const reload = await snap('same-session-empty-reload')
++  check('same-session-empty-reload', () => sameAnchor(completed, reload))
++  await page.screenshot({ path: `${output}/reading.png` })
++  await page.evaluate(() => { window.scrollProbe.label('history-prepend'); window.probe.enableHistory() }); await idle(100)
++  const preHistory = await snap('before-history')
++  // Exercise the production Show-earlier handler without browser click's
++  // scroll-into-view (which intentionally changes the chosen reading position).
++  await page.locator('[data-slot="aui_thread-viewport"]').getByRole('button', { name: 'Show earlier messages', exact: true }).evaluate(node => node.click())
++  await idle(1000); const history = await snap('history-prepend')
++  check('async-history-prepend-anchor', () => sameAnchor(preHistory, history))
++  // The just-restored frozen distance intentionally tracks late layout until
++  // real input. Give reading ownership back before testing native row growth.
++  await page.locator('[data-slot="aui_thread-viewport"]').hover()
++  await page.mouse.wheel(0, -80); await idle(350)
++  const beforeGrowth = await snap('reader-before-variable-height')
++  const growRow = beforeGrowth.visible.find(row => row.role === 'assistant' && row.top >= 0)
++  const nextRow = beforeGrowth.visible.find(row => row.role === 'assistant' && row.rowId > growRow.rowId)
++  await page.evaluate(rowId => { window.scrollProbe.label('variable-height'); window.probe.grow(rowId) }, growRow.rowId)
++  await idle(700); const grown = await snap('variable-height')
++  check('growing-visible-row-keeps-leading-edge', () => sameAnchor(beforeGrowth, grown))
++  check('following-content-moves-by-real-growth', () => {
++    const row = grown.visible.find(row => row.rowId === growRow.rowId)
++    assert.ok(row.bottom - row.top > growRow.bottom - growRow.top + 100)
++    assert.ok(nextRow, 'fixture exposes a neighboring assistant before growth')
++    const next = grown.visible.find(row => row.rowId === nextRow.rowId)
++    assert.ok(next, 'neighbor remains measurable after growth')
++    const heightDelta = row.bottom - row.top - (growRow.bottom - growRow.top)
++    assert.ok(Math.abs(next.top - nextRow.top - heightDelta) <= 2, 'neighbor moves by the actual added height')
++  })
++  await page.evaluate(() => { window.scrollProbe.label('explicit-jump'); window.probe.jump() }); await idle(700)
++  const jump = await snap('jump')
++  check('explicit-jump-to-bottom', () => assert.ok(Math.abs(jump.gap) <= 2))
++  await page.evaluate(() => { window.probe.start(); window.probe.append(8) }); await idle(500)
++  const followed = await snap('follow-after-jump')
++  check('follow-resumes-after-jump', () => assert.ok(Math.abs(followed.gap) <= 2))
++  // Same mounted viewport, different running transcript. A is already running
++  // so this browser cohort isolates owner identity from async runtime startup;
++  // the component regression separately covers A idle -> B running publication.
++  await page.evaluate(() => { window.scrollProbe.label('owner-A'); window.probe.ownerA() })
++  await page.waitForFunction(() => document.querySelector('[data-runtime-running]')?.dataset.runtimeRunning === 'true')
++  await idle(800)
++  const ownerA = await snap('owner-A')
++  await page.evaluate(() => {
++    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
++    const beforeHeight = viewport.scrollHeight
++    const content = viewport.querySelector('[data-slot="aui_thread-content"]')
++    const samples = []
++    let delivered = false
++    const measure = phase => samples.push({ phase, top: viewport.scrollTop, height: viewport.scrollHeight, contentHeight: content.getBoundingClientRect().height, sameContent: content === viewport.querySelector('[data-slot="aui_thread-content"]'), client: viewport.clientHeight, gap: viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop, running: document.querySelector('[data-runtime-running]')?.dataset.runtimeRunning, sameViewport: viewport === document.querySelector('[data-slot="aui_thread-viewport"]') })
++    const mutations = new MutationObserver(() => {
++      if (viewport.scrollHeight <= beforeHeight + 1000) return
++      mutations.disconnect()
++      delivered = true
++      measure('before-delayed-scroll')
++      viewport.dispatchEvent(new Event('scroll'))
++      measure('after-delayed-scroll')
++    })
++    mutations.observe(viewport.closest('[data-chat-surface]'), { attributes: true, attributeFilter: ['data-probe-owner'], childList: true, characterData: true, subtree: true })
++    const observer = new ResizeObserver(() => { queueMicrotask(() => measure(delivered ? 'resize-observer' : 'resize-before-mutation')) })
++    observer.observe(viewport.querySelector('[data-slot="aui_thread-content"]'))
++    window.ownerProbe = { finish: () => { observer.disconnect(); mutations.disconnect(); return samples } }
++    window.scrollProbe.label('owner-B')
++    window.probe.ownerB()
++  })
++  await idle(800)
++  const ownerB = await snap('owner-B')
++  const ownerSamples = await page.evaluate(() => window.ownerProbe.finish())
++  writeFileSync(`${output}/owner-frames.json`, JSON.stringify({ ownerA, ownerB, samples: ownerSamples }, null, 2))
++  check('owner-switch-real-running-same-viewport', () => {
++    assert.ok(ownerB.height > ownerA.height + 1000)
++    assert.ok(ownerSamples.length >= 3)
++    assert.ok(ownerSamples.every(sample => sample.sameViewport && sample.running === 'true'))
++  })
++  check('owner-switch-restores-before-delayed-scroll', () => {
++    const before = ownerSamples.find(sample => sample.phase === 'before-delayed-scroll')
++    assert.ok(before, 'observed incoming real DOM before native RO')
++    assert.ok(Math.abs(before.gap - 800) <= 2, `restored gap ${before.gap}`)
++  })
++  check('owner-switch-retains-reading-through-native-resize', () => {
++    const samples = ownerSamples.filter(sample => sample.phase === 'resize-observer')
++    assert.ok(samples.length >= 1)
++    assert.ok(samples.every(sample => Math.abs(sample.gap - 800) <= 2), `native RO gaps ${samples.map(sample => sample.gap).join(',')}`)
++    assert.ok(Math.abs(ownerB.gap - 800) <= 2, `settled gap ${ownerB.gap}`)
++  })
++  await page.screenshot({ path: `${output}/owner-reading.png` })
++  await page.evaluate(() => { window.scrollProbe.label('heavy-load'); window.probe.heavy() }); await idle(1800)
++  await snap('heavy-load')
++  await page.locator('[data-slot="aui_thread-viewport"]').hover(); await page.mouse.wheel(0,-1300); await idle(700)
++  const heavyReading = await snap('heavy-reading')
++  await page.evaluate(() => { window.scrollProbe.label('heavy-next-turn'); window.probe.nextTurn() }); await idle(500)
++  const heavyNext = await snap('heavy-next-turn')
++  check('budgeted-next-turn-keeps-reading', () => sameAnchor(heavyReading, heavyNext))
++  await page.screenshot({ path: `${output}/heavy.png` })
++  check('no-render-exceptions', () => assert.deepEqual(errors, []))
++  const frames = await page.evaluate(() => window.scrollProbe.finish())
++  check('stream-pin-reaches-bottom-in-resize-observer', () => {
++    const resizeSamples = frames.filter(frame => frame.label === 'ordered-stream-pin' && frame.phase === 'resize-observer')
++    assert.ok(resizeSamples.length >= 1, 'observed the real content resize after the controlled delayed scroll')
++    assert.ok(resizeSamples.every(frame => Math.abs(frame.gap) <= 2), `remaining gaps: ${resizeSamples.map(frame => frame.gap).join(',')}`)
++  })
++  writeFileSync(`${output}/frames.json`, JSON.stringify(frames))
++  writeFileSync(`${output}/results.json`, JSON.stringify({ viewport: { width:1440,height:960 }, reducedMotion:'no-preference', results, snapshots, errors, frameCount:frames.length }, null, 2))
++  console.log(JSON.stringify({ cases:results.length, passed:results.filter(x=>x.passed).length, failed:results.filter(x=>!x.passed).length, frames:frames.length }))
++  if (results.some(x => !x.passed)) process.exitCode = 1
++} finally { await browser?.close(); await server.close(); console.log('CLEANUP browser and Vite server closed') }

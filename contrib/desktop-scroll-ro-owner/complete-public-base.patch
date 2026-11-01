@@ -1,0 +1,2390 @@
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+index c680caa29188fef832912e202eceb2f84d6d972e..1973f93dca0b9836edc44eb5cf897cd31623c05b 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+@@ -118,12 +118,10 @@ import { pinnedOwnerCount, pinnedStoredSessionIdsForOwner, releaseStoredSessionP
+ import { applySessionInfoStatePatch, sessionInfoStatePatch } from './use-message-stream/utils'
+ import { captureSteeringSession } from './use-prompt-actions/steering-session'
+ import { useSessionActions } from './use-session-actions'
++import { ResumeHarness } from './use-session-actions/test-harness'
+ import {
+-  createPersistedDisplayTranscriptProvenance,
+-  suppressTranscriptForView,
+-  transcriptRowContentKey
++  createPersistedDisplayTranscriptProvenance
+ } from './use-session-actions/transcript-provenance'
+-import type { TranscriptViewCutoff } from './use-session-actions/transcript-provenance'
+ import { useSessionStateCache } from './use-session-state-cache'
+ 
+ vi.mock('@/hermes', async importOriginal => ({
+@@ -1708,95 +1706,6 @@ describe('createBackendSessionForSend profile routing', () => {
+ // hook must (a) not throw out of the fallback (which stranded the loader), and
+ // (b) arm $resumeFailedSessionId so use-route-resume can retry. A resume that
+ // succeeds must NOT leave the flag armed.
+-function ResumeHarness({
+-  onStateUpdate,
+-  onViewSync,
+-  onReady,
+-  getRouteToken = () => 'token',
+-  requestGateway,
+-  runtimeIdByStoredSessionIdRef,
+-  selectedStoredSessionId = null,
+-  sessionStateByRuntimeIdRef
+-}: {
+-  getRouteToken?: () => string
+-  onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
+-  onViewSync?: (sessionId: string, state: ClientSessionState) => void
+-  onReady: (
+-    resume: (
+-      storedSessionId: string,
+-      replaceRoute?: boolean,
+-      ownerRoute?: SessionProfileRoute,
+-      options?: { authoritativeSnapshot?: boolean }
+-    ) => Promise<unknown>
+-  ) => void
+-  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+-  runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
+-  selectedStoredSessionId?: string | null
+-  sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
+-}) {
+-  const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+-  const runtimeMapRef = runtimeIdByStoredSessionIdRef ?? ref(new Map<string, string>())
+-  const stateMapRef = sessionStateByRuntimeIdRef ?? ref(new Map<string, ClientSessionState>())
+-  // Stand in for the real hook's gate: without it this stub would publish the
+-  // unproven warm cache before REST authority lands. Kept here (not per-test)
+-  // so every resume through this harness sees one shared suppression policy.
+-  const heldCutoffsByRuntimeIdRef = ref(new Map<string, TranscriptViewCutoff>())
+-
+-  const actions = useSessionActions({
+-    activeSessionId: null,
+-    activeSessionIdRef: ref<string | null>(null),
+-    busyRef: ref(false),
+-    creatingSessionRef: ref(false),
+-    ensureSessionState: () => ({}) as ClientSessionState,
+-    getRouteToken,
+-    getRoutedStoredSessionId: () => null,
+-    navigate: vi.fn() as never,
+-    requestGateway,
+-    resetViewSync: vi.fn(),
+-    routedSessionId: null,
+-    runtimeIdByStoredSessionIdRef: runtimeMapRef,
+-    selectedStoredSessionId,
+-    selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
+-    sessionStateByRuntimeIdRef: stateMapRef,
+-    holdSessionTranscriptView: runtimeId => {
+-      const rows = stateMapRef.current.get(runtimeId)?.messages ?? []
+-
+-      const cutoff: TranscriptViewCutoff = {
+-        cutoffIds: new Set(rows.map(message => message.id)),
+-        cutoffKeys: new Set(rows.map(transcriptRowContentKey))
+-      }
+-
+-      heldCutoffsByRuntimeIdRef.current.set(runtimeId, cutoff)
+-
+-      return () => {
+-        heldCutoffsByRuntimeIdRef.current.delete(runtimeId)
+-      }
+-    },
+-    syncSessionStateToView: (sessionId, state) => {
+-      const cutoff = heldCutoffsByRuntimeIdRef.current.get(sessionId) ?? null
+-
+-      onViewSync?.(sessionId, suppressTranscriptForView(state, cutoff))
+-    },
+-    updateSessionState: (sessionId, updater, storedSessionId) => {
+-      // Full default shape (not a bare {} cast) so seeded/derived fields like
+-      // turnStartedAt behave as in production state updates.
+-      const current = stateMapRef.current.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
+-      const next = updater(current)
+-
+-      stateMapRef.current.set(sessionId, next)
+-      onStateUpdate?.(sessionId, next)
+-
+-      return next
+-    }
+-  })
+-
+-  useEffect(() => {
+-    onReady(actions.resumeSession)
+-  }, [actions.resumeSession, onReady])
+-
+-  return null
+-}
+-
+ function ResumeTimerHarness({
+   onReady,
+   requestGateway
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/cached-commentary-case-repro.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/cached-commentary-case-repro.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..11369a8a95e28ef79b5d7abb519dd66e5b1487be
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/cached-commentary-case-repro.test.ts
+@@ -0,0 +1,70 @@
++import { expect, it } from 'vitest'
++
++import { type ChatMessage, chatMessageText, toChatMessages, upsertToolPart } from '@/lib/chat-messages'
++import type { SessionMessage, SessionResumeResult } from '@/types/hermes'
++
++import { reconcilePersistedLiveTurn } from './persisted-live-turn'
++
++const text = 'Inspecting a synthetic isolated sample.\n\nKeep this public paragraph once and retain every tool result.'
++const prompt = 'Continue.'
++const calls = Array.from({ length: 7 }, (_, i) => ({ id: `tool-${i}`, type: 'function', function: { name: 'demo', arguments: '{}' } }))
++
++// Every string is synthetic. No production reasoning was read or replayed.
++it.each([false, true])('reconcile cached commentary with shared tools; reasoning layout differs=%s', differs => {
++  const rows: SessionMessage[] = [
++    { id: 1, role: 'user', content: prompt, timestamp: 100 },
++    { id: 2, role: 'assistant', content: '', display_commentary: [text], display_reasoning: 'Synthetic stored layout', tool_calls: calls, timestamp: 118.880 }
++  ]
++
++  const hydrated = toChatMessages(rows)
++
++  const local: ChatMessage[] = [
++    hydrated[0],
++    { id: 'assistant-stream-interim', role: 'assistant', pending: false, interim: true, timestamp: 118.141,
++      parts: [
++        { type: 'reasoning', text: differs ? 'Synthetic streamed layout' : 'Synthetic stored layout', timestamp: 117 },
++        { type: 'text', text, timestamp: 118.141 }
++      ] },
++    { id: 'assistant-stream-tools', role: 'assistant', pending: true,
++      parts: hydrated[1].parts.filter(part => part.type === 'tool-call').map(part =>
++        upsertToolPart([part], { tool_id: part.toolCallId, name: 'demo', result: 'late synthetic result' }, 'complete', 119)[0]) }
++  ]
++
++  const projection = { session_id: 'runtime', inflight: { user: prompt, assistant: '', streaming: true } } as SessionResumeResult
++  const result = reconcilePersistedLiveTurn(hydrated, local, rows, projection)!
++  const visible = result.filter(row => row.role === 'assistant').map(row => chatMessageText(row).trim()).filter(Boolean)
++  console.log('cache-shape', JSON.stringify({ differs, visible, timestamps: result.filter(row => chatMessageText(row) === text).map(row => row.timestamp) }))
++  expect(visible).toEqual([text])
++  const tools = result.flatMap(row => row.parts.filter(part => part.type === 'tool-call'))
++  expect(tools).toHaveLength(7)
++  expect(tools.every(part => part.type === 'tool-call' && part.result === 'late synthetic result')).toBe(true)
++})
++
++it.each([false, true])('control: keeps equal public commentary across distinct user turns; repeated prompt=%s', repeatedPrompt => {
++  const secondPrompt = repeatedPrompt ? prompt : 'Continue with a second task.'
++
++  const rows: SessionMessage[] = [
++    { id: 1, role: 'user', content: prompt },
++    { id: 2, role: 'assistant', content: '', display_commentary: [text], tool_calls: [calls[0]] },
++    { id: 3, role: 'tool', content: 'first task result', tool_call_id: calls[0].id },
++    { id: 4, role: 'user', content: secondPrompt },
++    { id: 5, role: 'assistant', content: '', display_commentary: [text], tool_calls: [calls[1]] }
++  ]
++
++  const history = toChatMessages(rows)
++
++  const local = history.map(message => message.role === 'assistant' && message.parts.some(part => part.type === 'tool-call' && part.toolCallId === calls[1].id)
++    ? { ...message, parts: message.parts.flatMap(part => part.type === 'tool-call'
++      ? upsertToolPart([part], { name: 'demo', tool_id: part.toolCallId, result: 'second task result' }, 'complete', 120)
++      : [part]) }
++    : message)
++
++  const result = reconcilePersistedLiveTurn(history, local, rows, {
++    session_id: 'runtime', inflight: { user: secondPrompt, assistant: '', streaming: true }
++  })!
++
++  expect(result.filter(message => message.role === 'assistant').map(chatMessageText).filter(Boolean)).toEqual([text, text])
++  expect(result.filter(message => message.role === 'user').map(message => message.rowId)).toEqual([1, 4])
++  expect(result.flatMap(message => message.parts).filter(part => part.type === 'tool-call').map(part => [part.toolCallId, part.result]))
++    .toEqual([[calls[0].id, 'first task result'], [calls[1].id, 'second task result']])
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/commentary-case-repro.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/commentary-case-repro.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c205cbf018bac64ae3cfe04078cce6425026cc8
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/commentary-case-repro.test.ts
+@@ -0,0 +1,50 @@
++import { expect, it } from 'vitest'
++
++import { type ChatMessage, chatMessageText, toChatMessages } from '@/lib/chat-messages'
++import type { SessionMessage, SessionResumeResult } from '@/types/hermes'
++
++import { reconcilePersistedLiveTurn } from './persisted-live-turn'
++
++const TEXT = 'Inspecting a synthetic isolated sample.\n\nKeep this public paragraph once and retain every tool result.'
++const PROMPT = 'Continue with the approved work.'
++const calls = Array.from({ length: 7 }, (_, i) => ({ id: `call-${i}`, type: 'function', function: { name: 'demo', arguments: '{}' } }))
++
++function scenario(content: string, commentary: string[], snapshot: string, previous: ChatMessage[] = []) {
++  const rows: SessionMessage[] = [
++    { id: 11, role: 'user', content: PROMPT, timestamp: 100 },
++    { id: 12, role: 'assistant', content, display_commentary: commentary, timestamp: 118.880, tool_calls: calls,
++      codex_message_items: [{ type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: TEXT }] }] }
++  ]
++
++  const projection = {
++    session_id: 'synthetic-runtime',
++    inflight: { user: PROMPT, assistant: snapshot, streaming: true }
++  } as SessionResumeResult
++
++  return reconcilePersistedLiveTurn(toChatMessages(rows), previous, rows, projection)!
++}
++
++const visible = (rows: ChatMessage[]) => rows.filter(row => row.role === 'assistant').map(row => chatMessageText(row).trim()).filter(Boolean)
++
++it('control: canonical content is subtracted from inflight exactly once', () => {
++  expect(visible(scenario(TEXT, [], TEXT))).toEqual([TEXT])
++})
++
++it('Codex commentary-only durable row is not painted again from inflight', () => {
++  const result = scenario('', [TEXT], TEXT)
++  console.log('commentary-only-visible', JSON.stringify(visible(result)))
++  expect(visible(result)).toEqual([TEXT])
++})
++
++it('Codex commentary plus a newer snapshot tail keeps only the new tail', () => {
++  const TAIL = 'A new result follows.'
++  expect(visible(scenario('', [TEXT], TEXT + '\n\n' + TAIL))).toEqual([TEXT, TAIL])
++})
++
++it('control: genuinely repeated text in a later segment is retained', () => {
++  expect(visible(scenario(TEXT, [], TEXT + '\n\n' + TEXT))).toEqual([TEXT, TEXT])
++})
++
++it('control: absent public projection never promotes raw provider sidecar', () => {
++  expect(visible(scenario('', [], 'New visible output'))).toEqual(['New visible output'])
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/commentary-history-refresh.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/commentary-history-refresh.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..55ed0a41060fe6c64b3c0a056a55c3731dd734bc
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/commentary-history-refresh.test.tsx
+@@ -0,0 +1,399 @@
++import type { GatewayEventName } from '@hermes/shared'
++import { act, cleanup, render, waitFor } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { getLatestSessionMessages, getSession, type SessionInfo } from '@/hermes'
++import { chatMessageText, toChatMessages } from '@/lib/chat-messages'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { clearClarifyRequest } from '@/store/clarify'
++import { requestGatewayForAgent, requestGatewayForProfile } from '@/store/gateway'
++import {
++  setActiveSessionId,
++  setConnection,
++  setMessages,
++  setResumeFailedSessionId,
++  setSessions,
++  setSessionStartedAt
++} from '@/store/session'
++import { deferred } from '@/test/deferred'
++import type { SessionMessage } from '@/types/hermes'
++
++import { renderMessageStream } from '../use-message-stream/test-harness'
++
++import { ResumeHarness } from './test-harness'
++
++vi.mock('@/hermes', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  deleteSession: vi.fn(),
++  getSession: vi.fn(),
++  getAllSessionMessages: vi.fn(),
++  getLatestSessionMessages: vi.fn(),
++  listAllProfileSessions: vi.fn(),
++  setApiRequestProfile: vi.fn(),
++  setSessionArchived: vi.fn()
++}))
++
++vi.mock('@/store/profile', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  ensureGatewayAgent: vi.fn().mockResolvedValue(undefined),
++  ensureGatewayProfile: vi.fn().mockResolvedValue(undefined)
++}))
++
++vi.mock('@/store/gateway', async importOriginal => {
++  const original = await importOriginal<Record<string, unknown>>()
++
++  return {
++    ...original,
++    // Default-preserving spy: tests that route by the active source override it.
++    activeGatewayConnectionId: vi.fn(original.activeGatewayConnectionId as () => null | string),
++    requestGatewayForAgent: vi.fn(),
++    requestGatewayForProfile: vi.fn(),
++    retainGatewayForAgent: vi.fn(async () => () => undefined)
++  }
++})
++
++vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  noteActiveTreeGroup: vi.fn(),
++  revealTreePane: vi.fn()
++}))
++
++function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
++  return {
++    ended_at: null,
++    id: 'stored-1',
++    input_tokens: 0,
++    is_active: false,
++    last_active: 1,
++    message_count: 0,
++    model: null,
++    output_tokens: 0,
++    preview: null,
++    source: 'desktop',
++    started_at: 1,
++    title: 'stored',
++    tool_call_count: 0,
++    ...overrides
++  }
++}
++
++const clientState = createClientSessionState
++
++describe('resumeSession warm-cache mapping integrity', () => {
++  beforeEach(() => {
++    // Earlier describes (branchStoredSession) drive resumes through the
++    // profile path on the SAME hoisted mock; drop their recorded calls so the
++    // not-called assertions below only see this describe's traffic.
++    vi.mocked(requestGatewayForProfile).mockReset()
++    vi.mocked(requestGatewayForAgent).mockReset()
++  })
++
++  afterEach(() => {
++    cleanup()
++    setActiveSessionId(null)
++    setResumeFailedSessionId(null)
++    setSessionStartedAt(null)
++    setMessages([])
++    setSessions([])
++    vi.mocked(getSession).mockReset()
++    vi.mocked(getLatestSessionMessages)
++      .mockReset()
++      .mockResolvedValue({ messages: [] } as never)
++    vi.mocked(requestGatewayForAgent).mockReset()
++    clearClarifyRequest()
++    vi.mocked(requestGatewayForProfile).mockReset()
++    setConnection(null)
++    vi.restoreAllMocks()
++  })
++
++  it.each(
++    (['cold', 'warm'] as const)
++      .flatMap(mode =>
++        (['matching', 'absent', 'segmented'] as const).flatMap(reasoning =>
++          [false, true].flatMap(multipleCommentary =>
++            [false, true].map(completeBeforeRest => ({
++              mode,
++              reasoning,
++              multipleCommentary,
++              completeBeforeRest,
++              sealedBeforeRest: false,
++              emptySnapshot: false
++            }))
++          )
++        )
++      )
++      .concat(
++        (['cold', 'warm'] as const).map(mode => ({
++          mode,
++          reasoning: 'matching' as const,
++          multipleCommentary: false,
++          completeBeforeRest: false,
++          sealedBeforeRest: true,
++          emptySnapshot: false
++        }))
++      )
++      .concat(
++        (['cold', 'warm'] as const).flatMap(mode =>
++          (['matching', 'segmented'] as const).map(reasoning => ({
++            mode,
++            reasoning,
++            multipleCommentary: false,
++            completeBeforeRest: false,
++            sealedBeforeRest: false,
++            emptySnapshot: true
++          }))
++        )
++      )
++  )(
++    'does not duplicate a running Codex tool block during $mode history refresh with $reasoning live reasoning (multiple commentary: $multipleCommentary, complete before REST: $completeBeforeRest, sealed before REST: $sealedBeforeRest, empty snapshot: $emptySnapshot)',
++    async ({ mode, reasoning, multipleCommentary, completeBeforeRest, sealedBeforeRest, emptySnapshot }) => {
++      const sid = 'rt-A'
++
++      const commentary = emptySnapshot
++        ? 'Inspecting an isolated synthetic sample.\n\nThe public update must occur once while completed tool output remains available.'
++        : 'I will compare isolated frontend and backend worktrees.'
++
++      const comments = multipleCommentary
++        ? [commentary, 'The two delegates will use separate directories.']
++        : [commentary]
++
++      const publicText = comments.join('\n\n')
++      const thinking = '**Preparing parallel worktrees**'
++      const privateReasoning = 'PRIVATE RAW ANALYSIS: not authorized for display.'
++      const prompt = 'Investigate the duplicate block.'
++
++      const call = (id: string, name: string, args: Record<string, unknown> = {}) => ({
++        id,
++        type: 'function' as const,
++        function: { name, arguments: JSON.stringify(args) }
++      })
++
++      const tasks = { tasks: [{ goal: 'FRONTEND' }, { goal: 'BACKEND' }] }
++
++      const rows: SessionMessage[] = [
++        { id: 1, role: 'user', content: prompt },
++        {
++          id: 2,
++          role: 'assistant',
++          content: '',
++          reasoning: `${privateReasoning}\n\n${thinking}\n\n${publicText}`,
++          display_reasoning: thinking,
++          display_commentary: comments,
++          codex_message_items: comments.map(text => ({
++            type: 'message',
++            role: 'assistant',
++            phase: 'commentary',
++            content: [{ type: 'output_text', text }]
++          })),
++          tool_calls: [call('read', 'read_file')]
++        },
++        { id: 3, role: 'tool', content: 'read', tool_call_id: 'read' },
++        { id: 4, role: 'assistant', content: '', tool_calls: [call('delegate', 'delegate_task', tasks)] },
++        { id: 5, role: 'tool', content: '{"status":"running"}', tool_call_id: 'delegate' },
++        {
++          id: 6,
++          role: 'assistant',
++          content: '',
++          tool_calls: [call('cmd-1', 'terminal'), call('cmd-2', 'terminal'), call('cmd-3', 'terminal')]
++        },
++        // The history snapshot predates cmd-3's completion.
++        ...[1, 2].map((n): SessionMessage => ({ id: 6 + n, role: 'tool', content: 'ok', tool_call_id: `cmd-${n}` }))
++      ]
++
++      setSessions([storedSession({ id: 'stored-A', message_count: rows.length })])
++      const states = new Map([[sid, { ...clientState('stored-A'), messages: toChatMessages(rows.slice(0, 1)) }]])
++      const stream = renderMessageStream(null, { states })
++
++      const send = (type: GatewayEventName, payload: Record<string, unknown> = {}) =>
++        act(() => stream.handleEvent({ type, payload, session_id: sid }))
++
++      await send('message.start')
++
++      if (reasoning !== 'absent') {
++        await send('reasoning.delta', { text: reasoning === 'segmented' ? '**Preparing' : thinking })
++      }
++
++      for (const text of comments) {
++        await send('message.interim', { text })
++      }
++
++      if (reasoning === 'segmented') {
++        await send('reasoning.delta', { text: ' parallel worktrees**' })
++      }
++
++      await send('tool.start', { name: 'read_file', tool_id: 'read', args: {} })
++      await send('tool.complete', { name: 'read_file', tool_id: 'read', result: 'read' })
++      await send('tool.start', { name: 'delegate_task', tool_id: 'delegate', args: tasks })
++      await send('tool.complete', { name: 'delegate_task', tool_id: 'delegate', result: '{"status":"running"}' })
++
++      for (const n of [1, 2, 3]) {
++        await send('tool.start', { name: 'terminal', tool_id: `cmd-${n}`, args: {} })
++      }
++
++      const persisted = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
++      vi.mocked(getLatestSessionMessages).mockReturnValue(persisted.promise)
++
++      const requestGateway = vi.fn(
++        async () =>
++          ({
++            session_id: sid,
++            session_key: 'stored-A',
++            resumed: 'stored-A',
++            messages: [],
++            messages_omitted: true,
++            running: true,
++            info: {},
++            inflight: { user: prompt, assistant: emptySnapshot ? '' : publicText, streaming: true }
++          }) as never
++      )
++
++      let resume!: Parameters<Parameters<typeof ResumeHarness>[0]['onReady']>[0]
++      render(
++        <ResumeHarness
++          onReady={ready => (resume = ready)}
++          requestGateway={requestGateway}
++          runtimeIdByStoredSessionIdRef={{ current: new Map(mode === 'warm' ? [['stored-A', sid]] : []) }}
++          sessionStateByRuntimeIdRef={{ current: states }}
++        />
++      )
++      let refreshing!: Promise<unknown>
++      await act(async () => {
++        refreshing = resume('stored-A', true)
++      })
++      await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalled())
++
++      // Real stream reducers advance the cached row while the REST read is held.
++      const completeTool = (n: number) =>
++        send('tool.complete', {
++          name: 'terminal',
++          tool_id: `cmd-${n}`,
++          result: 'ok',
++          duration_s: 1.25,
++          summary: 'Command completed.'
++        })
++
++      for (const n of sealedBeforeRest ? [1, 2] : [1, 2, 3]) {
++        await completeTool(n)
++      }
++
++      const sharedTools = () =>
++        states
++          .get(sid)!
++          .messages.flatMap(message => message.parts)
++          .filter(part => part.type === 'tool-call' && part.toolCallId === 'cmd-3')
++
++      if (sealedBeforeRest) {
++        await send('message.interim', { text: 'Waiting for the last command.' })
++        expect(sharedTools()).toHaveLength(1)
++        expect(sharedTools()[0].completedAt).toEqual(expect.any(Number))
++        expect(Object.hasOwn(sharedTools()[0], 'result')).toBe(false)
++      } else {
++        expect(sharedTools()[0]).toMatchObject({
++          result: 'ok',
++          completedAt: expect.any(Number),
++          toolResultMetadata: { duration_s: 1.25, summary: 'Command completed.' }
++        })
++      }
++
++      let completedTool = sharedTools()[0]
++
++      if (multipleCommentary) {
++        await send('reasoning.delta', { text: 'New live-only reasoning must survive.' })
++        await send('message.interim', { text: commentary })
++      }
++
++      await send('tool.start', { name: 'delegate_task', tool_id: 'live-only', args: tasks })
++
++      const complete = async () => {
++        await send('tool.complete', { name: 'delegate_task', tool_id: 'live-only', result: 'finished' })
++        await send('message.delta', { text: 'Comparison complete.' })
++        await send('message.complete', { text: 'Comparison complete.' })
++      }
++
++      if (completeBeforeRest) {
++        await complete()
++        expect(states.get(sid)!.messages.some(message => message.pending)).toBe(false)
++        expect(states.get(sid)!.messages.at(-1)?.completedAt).toEqual(expect.any(Number))
++      }
++
++      const completedAt = states.get(sid)!.messages.at(-1)?.completedAt
++
++      await act(async () => {
++        persisted.resolve({ session_id: 'stored-A', messages: rows })
++        await refreshing
++      })
++
++      if (sealedBeforeRest) {
++        expect(sharedTools()).toHaveLength(1)
++        expect.soft(Object.hasOwn(sharedTools()[0], 'result')).toBe(false)
++
++        const durableOwner = states.get(sid)!.messages.find(message => message.parts.includes(sharedTools()[0]))!
++
++        expect(durableOwner.rowId).toBe(rows[1].id)
++        await completeTool(3)
++        expect(sharedTools()).toHaveLength(1)
++        expect(states.get(sid)!.messages.find(message => message.parts.includes(sharedTools()[0]))?.id).toBe(
++          durableOwner.id
++        )
++        completedTool = sharedTools()[0]
++        expect(completedTool).toMatchObject({
++          result: 'ok',
++          completedAt: expect.any(Number),
++          toolResultMetadata: { duration_s: 1.25, summary: 'Command completed.' }
++        })
++      }
++
++      const messages = states.get(sid)!.messages
++      const tools = messages.flatMap(message => message.parts.filter(part => part.type === 'tool-call'))
++      expect
++        .soft(tools.map(part => part.toolCallId))
++        .toEqual(['read', 'delegate', 'cmd-1', 'cmd-2', 'cmd-3', 'live-only'])
++      expect(tools.filter(part => part.toolCallId === 'cmd-3')).toEqual([
++        expect.objectContaining({
++          result: 'ok',
++          completedAt: completedTool.completedAt,
++          toolResultMetadata: completedTool.toolResultMetadata
++        })
++      ])
++
++      for (const text of comments) {
++        expect
++          .soft(messages.map(chatMessageText).join('\n').split(text))
++          .toHaveLength(multipleCommentary && text === commentary ? 3 : 2)
++      }
++
++      expect(JSON.stringify(messages)).not.toContain(privateReasoning)
++
++      if (multipleCommentary) {
++        expect(JSON.stringify(messages)).toContain('New live-only reasoning must survive.')
++      }
++
++      expect.soft(messages.some(message => message.pending)).toBe(!completeBeforeRest)
++      expect(messages.filter(message => message.role === 'assistant' && !message.parts.length)).toHaveLength(0)
++      expect(
++        messages.some(
++          message =>
++            message.pending && message.parts.some(part => part.type === 'tool-call' && part.toolCallId === 'live-only')
++        )
++      ).toBe(!completeBeforeRest)
++
++      if (completeBeforeRest) {
++        expect(messages.at(-1)?.completedAt).toBe(completedAt)
++      } else {
++        await complete()
++      }
++
++      const settled = states.get(sid)!.messages
++      expect(settled.some(message => message.pending)).toBe(false)
++      expect(settled.map(chatMessageText).join('\n').split('Comparison complete.')).toHaveLength(2)
++      expect(
++        settled
++          .flatMap(message => message.parts)
++          .find(part => part.type === 'tool-call' && part.toolCallId === 'live-only')
++      ).toMatchObject({ result: 'finished' })
++      expect(
++        settled.flatMap(message => message.parts.filter(part => part.type === 'tool-call')).map(part => part.toolCallId)
++      ).toEqual(tools.map(part => part.toolCallId))
++    }
++  )
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index b4a268c1765903130422815500f171a9681e08c1..7f868a1a5f4179840d071c3c29f81ed43fce10f1 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -135,12 +135,7 @@ import { clearSessionSubagents } from '@/store/subagents'
+ import { clearSessionTodos, restoreSessionTodosFromSnapshot } from '@/store/todos'
+ import { dropTranscriptTail, dropTranscriptTailEverywhere, saveTranscriptTail } from '@/store/transcript-tail-cache'
+ import { isWatchWindow } from '@/store/windows'
+-import type {
+-  SessionCreateResponse,
+-  SessionMessagesResponse,
+-  SessionResumeResult,
+-  UsageStats
+-} from '@/types/hermes'
++import type { SessionCreateResponse, SessionMessagesResponse, SessionResumeResult, UsageStats } from '@/types/hermes'
+ 
+ import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
+ import type { ClientSessionState, SidebarNavItem } from '../../../types'
+@@ -186,7 +181,9 @@ import {
+   liveTurnSettledDuringResume,
+   reconcileAuthoritativeChatMessages,
+   reconcileAuthoritativeMessages,
+-  resumedStreamTarget
++  reconcileRuntimeMessageChanges,
++  resumedStreamTarget,
++  resumeExpectsTranscript
+ } from './resume-reconcile'
+ import { backgroundRuntimeOptions, runtimeOwner, runtimeOwnerProfile } from './runtime-owner'
+ import { createGatewaySession, desktopSessionCreateParams } from './session-create-request'
+@@ -1758,7 +1755,8 @@ export function useSessionActions({
+                     persistedMessages,
+                     cachedWithoutEarlyClarify ?? previousMessages,
+                     persisted.messages,
+-                    liveProjection
++                    liveProjection,
++                    activatedLivenessState.messages
+                   )
+ 
+                   // `null` does not depend on `previous`; retrying the live-turn
+@@ -2058,7 +2056,12 @@ export function useSessionActions({
+             : viewMessagesForReconcile()
+ 
+           // Tail page + previously backfilled prefix (same-session re-resume).
+-          prefetchedPage = await graftTranscriptPage(prefetchedResult, previousMessages, storedSessionId, sessionRestScope)
++          prefetchedPage = await graftTranscriptPage(
++            prefetchedResult,
++            previousMessages,
++            storedSessionId,
++            sessionRestScope
++          )
+           prefetchedTranscriptMessages = prefetchedPage.transcript
+           localSnapshot = prefetchedPage.snapshot
+           prefetchApplied = true
+@@ -2152,10 +2155,14 @@ export function useSessionActions({
+         const currentRuntimeMessages =
+           sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages ?? resumeRuntimeBaselineMessages
+ 
+-        const preferredWithRuntimeChanges = overlayConcurrentMessageChanges(
++        const preferredWithRuntimeChanges = reconcileRuntimeMessageChanges(
+           preferredMessages,
+           resumeRuntimeBaselineMessages,
+-          currentRuntimeMessages
++          currentRuntimeMessages,
++          resumed,
++          prefetchedTranscriptMessages,
++          prefetchedResult,
++          prefetchMatchesResumedSession
+         )
+ 
+         // #70449: same stale-snapshot guard as the warm path — a turn that
+@@ -2201,21 +2208,7 @@ export function useSessionActions({
+         // is safer than surfacing the in-flight turn alone). Recovery only
+         // ever appends, so this matches the final transcript's emptiness.
+         //
+-        // "Should have a transcript" is not the cached sessions-list row alone.
+-        // That row is a cache of backend truth and lags the two flows that
+-        // report a vanished thread: after a wake/reconnect the list can still
+-        // carry the respawned backend's session at message_count 0, and a
+-        // compression tip can show 0 rows while the stored transcript is
+-        // intact. Conditioning the latch on it alone paints a blank thread
+-        // UNLATCHED — no retry, no error, just an empty chat that looks like
+-        // lost history. The resume RPC is authoritative and always reports the
+-        // stored size (`message_count`, filled from state.db even when
+-        // `messages_omitted`), so treat it — and a non-empty REST page — as the
+-        // other rungs of the same ladder.
+-        const saidToHaveTranscript =
+-          sessionShouldHaveTranscript(stored) ||
+-          (resumed.message_count || 0) > 0 ||
+-          Boolean(prefetchedResult?.messages.length)
++        const saidToHaveTranscript = resumeExpectsTranscript(stored, resumed, prefetchedResult)
+ 
+         if (saidToHaveTranscript && preferredMessages.length === 0) {
+           // Roll back a provisional cached-tail paint and drop its entry: the
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/live-turn-remainder.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/live-turn-remainder.test.ts
+index edb5fecd93fae2b3f1dffde0c31c24bb8419d824..4cdedff82782b0caac19256c85b81a16397cbad0 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/live-turn-remainder.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/live-turn-remainder.test.ts
+@@ -101,6 +101,32 @@ it('settles a matching partial error without discarding richer local parts or di
+   ])
+ })
+ 
++it('does not let completion already present at the snapshot settle a newer streaming projection', () => {
++  const rows: SessionMessage[] = [{ id: 1, role: 'user', content: 'Continue the investigation' }]
++  const durable = toChatMessages(rows)
++  const completed = assistant('previous-response', 'Earlier result.', { pending: false, completedAt: 10 })
++  const baseline = [...durable, completed]
++
++  const messages = reconcilePersistedLiveTurn(
++    durable,
++    baseline,
++    rows,
++    {
++      session_id: 'runtime',
++      inflight: { user: 'Continue the investigation', assistant: 'New work is running.', streaming: true }
++    },
++    baseline
++  )!
++
++  expect(messages).toContainEqual(completed)
++  expect(messages.filter(message => message.pending)).toEqual([
++    expect.objectContaining({
++      role: 'assistant',
++      parts: [{ type: 'text', text: 'New work is running.' }]
++    })
++  ])
++})
++
+ it('pairs only the queue projection, preserving equal corrections and different local queued occurrences', () => {
+   const prompt = 'Inspect this file'
+   const correction = 'Also inspect its tests'
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/persisted-live-turn.ts b/apps/desktop/src/app/session/hooks/use-session-actions/persisted-live-turn.ts
+index 695df1b8a2e07ba82a03158503981553f36b0399..f135bfbf720f4fb2ccedbae42540d801b8f2447c 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/persisted-live-turn.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/persisted-live-turn.ts
+@@ -1,5 +1,12 @@
+ import { textWithoutReferenceLines } from '@/components/assistant-ui/reference-kinds'
+-import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
++import {
++  assistantTextPart,
++  type ChatMessage,
++  type ChatMessagePart,
++  chatMessageText,
++  textPart,
++  upsertToolPart
++} from '@/lib/chat-messages'
+ import { withoutCoveredAssistantPrefix } from '@/lib/chat-messages/coverage'
+ import { parseErrorSurface } from '@/lib/error-surface'
+ import type { SessionMessage, SessionResumeResult } from '@/types/hermes'
+@@ -24,6 +31,26 @@ interface PersistedTurn {
+   messages: ChatMessage[]
+ }
+ 
++/** Source-row identity and rendered occurrences must agree before subtracting raw text. */
++function commentaryWasPainted(row: SessionMessage, texts: string[], messages: ChatMessage[]): boolean {
++  const id = rowId(row)
++  // MEDIA rendering and folding change lengths. Equal prose alone is not coverage.
++  const rendered = texts.map(text => renderedText(text).trim()).filter(Boolean)
++
++  const painted = messages.flatMap(message =>
++    message.parts.flatMap(part =>
++      part.type === 'text' && part.sourceRowId === id && part.text.trim() ? [part.text.trim()] : []
++    )
++  )
++
++  return (
++    id !== undefined &&
++    rendered.length > 0 &&
++    painted.length === rendered.length &&
++    rendered.every((text, index) => text === painted[index])
++  )
++}
++
+ /** Validate the current turn's source rows against the occurrences actually painted. */
+ function candidateTurn(
+   rows: SessionMessage[],
+@@ -59,24 +86,16 @@ function candidateTurn(
+         return null
+       }
+ 
+-      const raw = row.content
++      // Codex commentary can be durable only in the authorized display sidecar,
++      // while content is empty and reasoning also contains the private summary.
++      const texts = row.content ? [row.content] : (row.display_commentary ?? [])
++      const raw = texts.join('\n\n')
+ 
+       if (!raw.trim()) {
+         continue
+       }
+ 
+-      const id = rowId(row)
+-
+-      // MEDIA rendering and folding change lengths. Only source-row provenance,
+-      // not equal prose elsewhere in the transcript, proves display coverage.
+-      const rendered = renderedText(raw).trim()
+-
+-      if (
+-        id === undefined ||
+-        !turnMessages.some(message =>
+-          message.parts.some(part => part.type === 'text' && part.sourceRowId === id && part.text.trim() === rendered)
+-        )
+-      ) {
++      if (!commentaryWasPainted(row, texts, turnMessages)) {
+         return null
+       }
+ 
+@@ -190,6 +209,44 @@ function snapshotIntervals(inflight: NonNullable<SessionResumeResult['inflight']
+   )
+ }
+ 
++/** Snapshot text and completion timing choose the live remainder, not cache age alone. */
++function projectSnapshotInterval(
++  text: string,
++  inflight: NonNullable<SessionResumeResult['inflight']>,
++  sessionId: string,
++  index: number,
++  final: boolean,
++  localTerminal?: ChatMessage,
++  snapshotBaseline?: ChatMessage[]
++): ChatMessage[] {
++  const error = final ? inflight.error?.trim() : undefined
++
++  // Only a completion observed after this snapshot can overrule streaming.
++  // An already-completed cache row must not settle a later real turn.
++  const completedSinceSnapshot = Boolean(
++    final &&
++    snapshotBaseline &&
++    localTerminal?.role === 'assistant' &&
++    !localTerminal.pending &&
++    !localTerminal.interim &&
++    localTerminal.completedAt !== undefined &&
++    snapshotBaseline.find(message => message.id === localTerminal.id)?.completedAt !== localTerminal.completedAt
++  )
++
++  return text.trim() || (final && !completedSinceSnapshot)
++    ? [
++        {
++          id: final ? `assistant-stream-${sessionId}` : `inflight-assistant-segment-${index}-${sessionId}`,
++          role: 'assistant',
++          parts: text.trim() ? [assistantTextPart(text)] : [],
++          pending: final && Boolean(inflight.streaming) && !completedSinceSnapshot,
++          ...(!final ? { interim: true } : {}),
++          ...(error ? { error, errorSurface: parseErrorSurface(inflight.error_surface) ?? undefined } : {})
++        }
++      ]
++    : []
++}
++
+ /**
+  * Reconcile the anchored partial turn before role-ordinal pairing sees it.
+  * Missing provenance takes the legacy path without subtracting any snapshot text.
+@@ -198,7 +255,8 @@ export function reconcilePersistedLiveTurn(
+   messages: ChatMessage[],
+   previous: ChatMessage[],
+   rows: SessionMessage[],
+-  projection: Pick<SessionResumeResult, 'inflight' | 'queued' | 'session_id'>
++  projection: Pick<SessionResumeResult, 'inflight' | 'queued' | 'session_id'>,
++  snapshotBaseline?: ChatMessage[]
+ ): ChatMessage[] | null {
+   const inflight = projection.inflight
+ 
+@@ -256,26 +314,53 @@ export function reconcilePersistedLiveTurn(
+     const text = unrepresentedText(snapshots[index], raw)
+ 
+     const final = index === snapshots.length - 1
+-    const error = final ? inflight.error?.trim() : undefined
+-
+-    const projected: ChatMessage[] =
+-      text.trim() || final
+-        ? [
+-            {
+-              id: final
+-                ? `assistant-stream-${projection.session_id}`
+-                : `inflight-assistant-segment-${index}-${projection.session_id}`,
+-              role: 'assistant',
+-              parts: text.trim() ? [assistantTextPart(text)] : [],
+-              pending: final && Boolean(inflight.streaming),
+-              ...(!final ? { interim: true } : {}),
+-              ...(error ? { error, errorSurface: parseErrorSurface(inflight.error_surface) ?? undefined } : {})
+-            }
+-          ]
+-        : []
+-
+-    const local = pairedLocal ? withoutCoveredAssistantPrefix(durable, cached.intervals[index] ?? []) : []
+-    result.push(...durable, ...mergeLiveAssistantRun(projected, local))
++
++    const projected = projectSnapshotInterval(
++      text,
++      inflight,
++      projection.session_id,
++      index,
++      final,
++      pairedLocal ? cached.intervals[index]?.at(-1) : undefined,
++      snapshotBaseline
++    )
++
++    const coveredTools = new Map<ChatMessagePart, ChatMessagePart>()
++    const local = pairedLocal ? withoutCoveredAssistantPrefix(durable, cached.intervals[index] ?? [], coveredTools) : []
++
++    // Coverage proves identity, not freshness: a consumed live call can have
++    // completed while REST still held only its start. Never borrow from a suffix.
++    // A seal also sets completedAt; only an own result proves tool.complete.
++    const completedDurable = durable.map(message => {
++      let changed = false
++
++      const parts = message.parts.map(part => {
++        const live = coveredTools.get(part)
++
++        if (
++          part.type !== 'tool-call' ||
++          part.result !== undefined ||
++          live?.type !== 'tool-call' ||
++          !Object.hasOwn(live, 'result') ||
++          live.completedAt === undefined
++        ) {
++          return part
++        }
++
++        changed = true
++
++        return upsertToolPart(
++          [part],
++          { ...live.toolResultMetadata, name: live.toolName, tool_id: live.toolCallId, result: live.result },
++          'complete',
++          live.completedAt
++        )[0]
++      })
++
++      return changed ? { ...message, parts } : message
++    })
++
++    result.push(...completedDurable, ...mergeLiveAssistantRun(projected, local))
+ 
+     if (!final) {
+       const correction = stored.users[index] ?? {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/resume-reconcile.ts b/apps/desktop/src/app/session/hooks/use-session-actions/resume-reconcile.ts
+index 8f0b93fe96e67a7a3467fc13ac312ba2c1d4c990..79e7040972dd820fe9d281dad1195270ba501aa4 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/resume-reconcile.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/resume-reconcile.ts
+@@ -12,12 +12,18 @@
+  * transcript refresh.
+  */
+ 
++import type { SessionInfo } from '@/hermes'
+ import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
+ import type { SessionMessage, SessionResumeResult } from '@/types/hermes'
+ 
+ import { reconcilePersistedLiveTurn } from './persisted-live-turn'
+ import { turnSettledSince } from './settled-turns'
+-import { appendLiveSessionProjection, reconcileDurableHistory } from './utils'
++import {
++  appendLiveSessionProjection,
++  overlayConcurrentMessageChanges,
++  reconcileDurableHistory,
++  sessionShouldHaveTranscript
++} from './utils'
+ 
+ /**
+  * Whether a re-resume of the chat on screen must keep the live transcript: a
+@@ -66,6 +72,43 @@ export function reconcileAuthoritativeMessages(
+   )
+ }
+ 
++// "Should have a transcript" is not the cached sessions-list row alone.
++// That row is a cache of backend truth and lags the two flows that
++// report a vanished thread: after a wake/reconnect the list can still
++// carry the respawned backend's session at message_count 0, and a
++// compression tip can show 0 rows while the stored transcript is
++// intact. Conditioning the latch on it alone paints a blank thread
++// UNLATCHED — no retry, no error, just an empty chat that looks like
++// lost history. The resume RPC is authoritative and always reports the
++// stored size (`message_count`, filled from state.db even when
++// `messages_omitted`), so treat it — and a non-empty REST page — as the
++// other rungs of the same ladder.
++export function resumeExpectsTranscript(
++  stored: SessionInfo | undefined,
++  resumed: Pick<SessionResumeResult, 'message_count'>,
++  prefetched: { messages: SessionMessage[] } | null
++): boolean {
++  return sessionShouldHaveTranscript(stored) || (resumed.message_count || 0) > 0 || Boolean(prefetched?.messages.length)
++}
++
++/** Consume the latest runtime prefix before an id-only overlay can restore folded tools. */
++export function reconcileRuntimeMessageChanges(
++  preferred: ChatMessage[],
++  baseline: ChatMessage[],
++  current: ChatMessage[],
++  projection: SessionResumeResult,
++  transcript: ChatMessage[] | null,
++  prefetched: { messages: SessionMessage[] } | null,
++  matchesSession: boolean
++): ChatMessage[] {
++  const turn =
++    matchesSession && transcript && prefetched
++      ? reconcilePersistedLiveTurn(transcript, current, prefetched.messages, projection, baseline)
++      : null
++
++  return turn ?? overlayConcurrentMessageChanges(preferred, baseline, current)
++}
++
+ /** Session-state patch for a restored blocking prompt row; the first non-null projection is used. */
+ export function livePromptStreamId(
+   ...projections: ({ streamId: string } | null)[]
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/test-harness.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/test-harness.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..241d558add5209da1a39441abc860ea228fd20ca
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/test-harness.tsx
+@@ -0,0 +1,100 @@
++import type { MutableRefObject } from 'react'
++import { useEffect } from 'react'
++import { vi } from 'vitest'
++
++import type { ClientSessionState } from '@/app/types'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import type { SessionProfileRoute } from '@/store/session-request-router'
++
++import { suppressTranscriptForView, transcriptRowContentKey, type TranscriptViewCutoff } from './transcript-provenance'
++
++import { useSessionActions } from './index'
++
++export function ResumeHarness({
++  onStateUpdate,
++  onViewSync,
++  onReady,
++  getRouteToken = () => 'token',
++  requestGateway,
++  runtimeIdByStoredSessionIdRef,
++  selectedStoredSessionId = null,
++  sessionStateByRuntimeIdRef
++}: {
++  getRouteToken?: () => string
++  onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
++  onViewSync?: (sessionId: string, state: ClientSessionState) => void
++  onReady: (
++    resume: (
++      storedSessionId: string,
++      replaceRoute?: boolean,
++      ownerRoute?: SessionProfileRoute,
++      options?: { authoritativeSnapshot?: boolean }
++    ) => Promise<unknown>
++  ) => void
++  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
++  runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
++  selectedStoredSessionId?: string | null
++  sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
++}) {
++  const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
++  const runtimeMapRef = runtimeIdByStoredSessionIdRef ?? ref(new Map<string, string>())
++  const stateMapRef = sessionStateByRuntimeIdRef ?? ref(new Map<string, ClientSessionState>())
++  // Stand in for the real hook's gate: without it this stub would publish the
++  // unproven warm cache before REST authority lands. Kept here (not per-test)
++  // so every resume through this harness sees one shared suppression policy.
++  const heldCutoffsByRuntimeIdRef = ref(new Map<string, TranscriptViewCutoff>())
++
++  const actions = useSessionActions({
++    activeSessionId: null,
++    activeSessionIdRef: ref<string | null>(null),
++    busyRef: ref(false),
++    creatingSessionRef: ref(false),
++    ensureSessionState: () => ({}) as ClientSessionState,
++    getRouteToken,
++    getRoutedStoredSessionId: () => null,
++    navigate: vi.fn() as never,
++    requestGateway,
++    resetViewSync: vi.fn(),
++    routedSessionId: null,
++    runtimeIdByStoredSessionIdRef: runtimeMapRef,
++    selectedStoredSessionId,
++    selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
++    sessionStateByRuntimeIdRef: stateMapRef,
++    holdSessionTranscriptView: runtimeId => {
++      const rows = stateMapRef.current.get(runtimeId)?.messages ?? []
++
++      const cutoff: TranscriptViewCutoff = {
++        cutoffIds: new Set(rows.map(message => message.id)),
++        cutoffKeys: new Set(rows.map(transcriptRowContentKey))
++      }
++
++      heldCutoffsByRuntimeIdRef.current.set(runtimeId, cutoff)
++
++      return () => {
++        heldCutoffsByRuntimeIdRef.current.delete(runtimeId)
++      }
++    },
++    syncSessionStateToView: (sessionId, state) => {
++      const cutoff = heldCutoffsByRuntimeIdRef.current.get(sessionId) ?? null
++
++      onViewSync?.(sessionId, suppressTranscriptForView(state, cutoff))
++    },
++    updateSessionState: (sessionId, updater, storedSessionId) => {
++      // Full default shape (not a bare {} cast) so seeded/derived fields like
++      // turnStartedAt behave as in production state updates.
++      const current = stateMapRef.current.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
++      const next = updater(current)
++
++      stateMapRef.current.set(sessionId, next)
++      onStateUpdate?.(sessionId, next)
++
++      return next
++    }
++  })
++
++  useEffect(() => {
++    onReady(actions.resumeSession)
++  }, [actions.resumeSession, onReady])
++
++  return null
++}
+diff --git a/apps/desktop/src/lib/chat-messages/coverage.test.ts b/apps/desktop/src/lib/chat-messages/coverage.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d4a10fa1abf6a67d567e0afe3b914c92f89708f
+--- /dev/null
++++ b/apps/desktop/src/lib/chat-messages/coverage.test.ts
+@@ -0,0 +1,62 @@
++import { describe, expect, it } from 'vitest'
++
++import { withoutCoveredAssistantPrefix } from './coverage'
++import type { ChatMessage, ChatMessagePart } from './types'
++
++const text = (value: string): ChatMessagePart => ({ type: 'text', text: value })
++const reasoning = (value: string): ChatMessagePart => ({ type: 'reasoning', text: value })
++
++const tool = (id: string): ChatMessagePart => ({
++  type: 'tool-call',
++  toolCallId: id,
++  toolName: 'read_file',
++  args: { path: 'same-file.ts' }
++})
++
++const assistant = (id: string, parts: ChatMessagePart[]): ChatMessage => ({ id, role: 'assistant', parts })
++
++describe('tool-anchored assistant coverage', () => {
++  it.each(['different-tool', 'different-text', 'user-boundary', 'error-boundary', 'reasoning-only'] as const)(
++    'preserves the unproven occurrence after a shared tool: %s',
++    scenario => {
++      const stored = [
++        assistant('durable', [tool('shared'), reasoning('next reasoning'), text('Continue?'), tool('durable-next')])
++      ]
++
++      const suffix: ChatMessage[] =
++        scenario === 'user-boundary'
++          ? [
++              { id: 'new-user', role: 'user', parts: [text('Continue?')] },
++              assistant('new-response', [text('Continue?'), tool('durable-next')])
++            ]
++          : [
++              {
++                ...assistant(
++                  'new-response',
++                  scenario === 'reasoning-only'
++                    ? [reasoning('next reasoning')]
++                    : [
++                        reasoning('next reasoning'),
++                        text(scenario === 'different-text' ? 'A different question?' : 'Continue?'),
++                        tool(scenario === 'different-tool' ? 'distinct-next' : 'durable-next')
++                      ]
++                ),
++                ...(scenario === 'error-boundary' ? { error: 'retain the failure' } : {})
++              }
++            ]
++
++      const local = [assistant('covered', [tool('shared')]), ...suffix]
++
++      const coveredTools = new Map<ChatMessagePart, ChatMessagePart>()
++      expect(withoutCoveredAssistantPrefix(stored, local, coveredTools)).toEqual(suffix)
++      expect([...coveredTools]).toEqual([[stored[0].parts[0], local[0].parts[0]]])
++    }
++  )
++
++  it('does not use equal commentary or reasoning as an occurrence anchor', () => {
++    const stored = [assistant('durable', [reasoning('durable planning'), text('Continue?'), tool('one')])]
++    const local = [assistant('live', [reasoning('stream planning'), text('Continue?'), tool('another')])]
++
++    expect(withoutCoveredAssistantPrefix(stored, local)).toBe(local)
++  })
++})
+diff --git a/apps/desktop/src/lib/chat-messages/coverage.ts b/apps/desktop/src/lib/chat-messages/coverage.ts
+index cac8c37c20ea9a9e6670f7a078b4b172cc892ef6..9990a419cba2b1db4ee9710efacf176670777c92 100644
+--- a/apps/desktop/src/lib/chat-messages/coverage.ts
++++ b/apps/desktop/src/lib/chat-messages/coverage.ts
+@@ -6,7 +6,7 @@ function sameOccurrencePart(stored: ChatMessagePart, local: ChatMessagePart): bo
+     return Boolean(stored.toolCallId) && stored.toolCallId === local.toolCallId
+   }
+ 
+-  if ((stored.type === 'text' || stored.type === 'reasoning') && local.type === stored.type) {
++  if (stored.type === 'text' && local.type === 'text') {
+     return normalizedText(stored.text) === normalizedText(local.text)
+   }
+ 
+@@ -14,42 +14,52 @@ function sameOccurrencePart(stored: ChatMessagePart, local: ChatMessagePart): bo
+ }
+ 
+ /** Subtract an ordered, tool-anchored prefix within an already matched user
+- * interval. Hydration can fold several live bubbles into one durable row;
+- * bubble ordinals and equal text alone cannot establish that coverage. */
+-export function withoutCoveredAssistantPrefix(stored: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
+-  const parts = stored.flatMap(message => (message.role === 'assistant' ? message.parts : []))
+-  let cursor = 0
+-  let anchored = false
+-  let stopped = false
+-  const remaining: ChatMessage[] = []
++ * interval. Reasoning visibility and segmentation differ between live events
++ * and durable display projections; only public text and tool IDs prove coverage.
++ * Report exact covered tool pairs so callers can retain newer completion state. */
++export function withoutCoveredAssistantPrefix(
++  stored: ChatMessage[],
++  local: ChatMessage[],
++  coveredTools?: Map<ChatMessagePart, ChatMessagePart>
++): ChatMessage[] {
++  const parts = stored.flatMap(message =>
++    message.role === 'assistant' ? message.parts.filter(part => part.type !== 'reasoning') : []
++  )
+ 
+-  for (const message of local) {
+-    if (stopped || message.role !== 'assistant' || message.error) {
+-      stopped = true
+-      remaining.push(message)
++  let cursor = 0
++  let covered: { message: number; part: number } | undefined
+ 
+-      continue
++  scan: for (const [messageIndex, message] of local.entries()) {
++    if (message.role !== 'assistant' || message.error) {
++      break
+     }
+ 
+-    let consumed = 0
++    for (const [partIndex, part] of message.parts.entries()) {
++      if (part.type === 'reasoning') {
++        continue
++      }
+ 
+-    for (const part of message.parts) {
+       if (!parts[cursor] || !sameOccurrencePart(parts[cursor], part)) {
+-        break
++        break scan
+       }
+ 
+-      anchored ||= part.type === 'tool-call'
+       cursor += 1
+-      consumed += 1
+-    }
+ 
+-    if (consumed < message.parts.length) {
+-      stopped = true
+-      remaining.push(consumed ? { ...message, parts: message.parts.slice(consumed) } : message)
++      if (part.type === 'tool-call') {
++        covered = { message: messageIndex, part: partIndex }
++        coveredTools?.set(parts[cursor - 1], part)
++      }
+     }
+   }
+ 
+-  // A coincidentally equal paragraph, without the same tool occurrence after
+-  // it, is insufficient evidence to remove anything.
+-  return anchored ? remaining : local
++  // Commit only through the last shared tool. Equal prose or reasoning after
++  // it can be a new occurrence and must survive until another tool anchors it.
++  if (!covered) {
++    return local
++  }
++
++  const message = local[covered.message]
++  const suffix = message.parts.slice(covered.part + 1)
++
++  return [...(suffix.length ? [{ ...message, parts: suffix }] : []), ...local.slice(covered.message + 1)]
+ }
+diff --git a/contrib/desktop-commentary-f301/README.md b/contrib/desktop-commentary-f301/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5e8ba204e43a3fa5bf7b9b941e8680bb6460508
+--- /dev/null
++++ b/contrib/desktop-commentary-f301/README.md
+@@ -0,0 +1,45 @@
++# Current-baseline regression supplement for upstream PR #132913
++
++This is a source-review branch for the existing Oidaladn0 contribution, not a competing PR or a release. The follow-up makes minimal structural extractions to meet the repository's code-health ratchet; it introduces no new deduplication algorithm.
++
++- Fixed official baseline: `f30105a0b4b3d0c1baa6c464189755ccdbc1ac7f`.
++- Original six-file contribution: NousResearch/hermes-agent#132913, head `16415106e0a3d9a81e370eaa9d8fdae5dde49cae`.
++- `0686fab7ae912c943a925a7f8710f34e3801b73e`: full original-author work integrated on the fixed baseline.
++- `46d82aa1312c2a392c4b40262ff5a7a8a3b25268`: three-file test-only extension, dependent on the complete preceding integration.
++- The subsequent structural follow-up moves the complete 30-case commentary refresh matrix into `commentary-history-refresh.test.tsx`, shares the existing `ResumeHarness` through `test-harness.tsx`, extracts resume reconciliation and transcript-expectation phases into the existing `resume-reconcile.ts`, and names the painted-row and snapshot-projection phases inside `persisted-live-turn.ts`. Assertions, source-row/tool identity requirements, completion freshness, valid repeated prose and tool results are retained. No ratchet policy or exceptions are changed.
++
++## Consume the final branch
++
++Use this branch's full Git diff from the fixed baseline, including newly added files, or the complete final patch supplied with the review. Do not combine this representation with cherry-picking the same commits. The full branch, not the historical embedded replay payload, is the final source candidate.
++
++With existing compatible workspace dependencies and Node 26+, run from `apps/desktop`:
++
++```sh
++node ../../node_modules/vitest/vitest.mjs run --project ui --configLoader runner --no-cache --maxWorkers 1 --no-file-parallelism \
++  src/app/session/hooks/use-session-actions/commentary-history-refresh.test.tsx \
++  src/app/session/hooks/use-session-actions/commentary-case-repro.test.ts \
++  src/app/session/hooks/use-session-actions/cached-commentary-case-repro.test.ts \
++  --testNamePattern 'empty snapshot: true|reconcile cached commentary|control:|Codex commentary'
++```
++
++Omit the name filter and select only `commentary-history-refresh.test.tsx` for all 30 hook variants. Neighbor selections are `coverage.test.ts`, `live-turn-remainder.test.ts`, `resume-structural-parts.test.ts`, `streamed-reply-survives-sync.test.ts`, and `resume-empty-prose-pairing.test.ts` in their existing modules. The six hydration/cache cases remain in `use-session-actions.test.tsx`; the extracted transcript-expectation predicate is also covered by that file's failure-latch cases. Use the repository's existing renderer TypeScript and ESLint commands for the changed surface.
++
++From the repository root, judge the exact final committed tree with all 14 native checks:
++
++```sh
++python scripts/check --base f30105a0b4b3d0c1baa6c464189755ccdbc1ac7f --commit "$(git rev-parse HEAD)"
++```
++
++This check is local lint/admission evidence, not proof that GitHub Actions ran or maintainers merged the branch. Dependency versions actually exercised are disclosed below; no exact-lock CI claim is made.
++
++## Historical payload: not the final structural candidate
++
++`replay-payload.zip`, `integrated-original-pr.patch` and `new-regressions.patch` are intentionally retained as the earlier behavior-stage evidence supplied by commit `e18e1a0f75c090aed8e3ffd8bd6114e67bc3f5cd`. Their embedded hashes, source and old hook-test path predate the structural follow-up. They do **not** replay or certify the final branch and must not be presented as its final patch. The two historical patches still describe the original six-file integration plus test-only extension, with MIT license and attribution. To inspect historical red/green behavior, use that frozen payload's own README and dependency disclosure; do not substitute its source identity for the final branch.
++
++## Executed scope and limits
++
++The preserved behavior-stage evidence reports the same 13 focused cases on baseline as 10 assertion failures / 3 passes, and the complete candidate as 13 passes. The prior developer cohort was 71 unique passing cases across overlapping 13 focused, 30 hook, 26 neighbor and 6 hydration selections. Independent QA's separate overlapping cohort was 55 unique cases, including 10 independent controls (baseline 7 failures / 3 passes; candidate 10 passes). These counts must not be added together. Final structural follow-up runs are supplied separately, bound to the final source, rather than relabeling these historical receipts.
++
++Actual reused dependencies: Node 26.12.1, React 19.2.7, Vitest 4.1.10, Vite 8.2.0, TypeScript 6.0.3 and jsdom 29.1.1. Both root and Desktop workspace dependencies are required, including the Vite Babel plugin; setup failures are not behavioral red tests. RPC/REST are test doubles; the real hook, reducers, history projection and tool-result consumers run in source tests. Fixture content is synthetic.
++
++This does not prove an actual Windows incident's unique cause, scrolling geometry, sidebar search performance, Electron packaging, upstream CI, merge/release, or installed-client adoption. Historical 190/1,049-case results belong to another baseline and are not claimed as current execution. No private transcripts, actual hidden reasoning, real user session identifiers, screenshots, account data, credentials or machine paths are included. The original MIT license and author attribution remain intact.
+diff --git a/contrib/desktop-commentary-f301/replay-payload.zip b/contrib/desktop-commentary-f301/replay-payload.zip
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ed7d68d0f02c8e6a458f556cbc6ce7424dd1408
+GIT binary patch
+literal 16508
+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
+E0MH#_O8@`>
+
+literal 0
+HcmV?d00001
+
+diff --git a/apps/desktop/scroll-probe.html b/apps/desktop/scroll-probe.html
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f26b77cf3168939129bfbeeca3a8a410c250735
+--- /dev/null
++++ b/apps/desktop/scroll-probe.html
+@@ -0,0 +1 @@
++<!doctype html><html><head><meta charset="utf-8"><title>Synthetic scroll continuity probe</title></head><body><div id="root"></div><script type="module" src="/src/test/scroll-continuity/fixture.tsx"></script></body></html>
+\ No newline at end of file
+diff --git a/apps/desktop/src/components/assistant-ui/thread/list-session-resize-owner.test.tsx b/apps/desktop/src/components/assistant-ui/thread/list-session-resize-owner.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..41ae8ca196271c44a1e6f408738d7c37505963ee
+--- /dev/null
++++ b/apps/desktop/src/components/assistant-ui/thread/list-session-resize-owner.test.tsx
+@@ -0,0 +1,144 @@
++import { AssistantRuntimeProvider, type ThreadMessage, useAuiState, useExternalStoreRuntime } from '@assistant-ui/react'
++import { act, render } from '@testing-library/react'
++import { expect, it, vi } from 'vitest'
++
++import { rescopeConnectionScopedStores } from '@/lib/connection-scoped'
++import { setActiveProfile } from '@/store/profile'
++import { getThreadScrollPosition, saveThreadScrollPosition } from '@/store/thread-scroll'
++
++import { stubThreadEnvironment, stubThreadViewportSize } from '../test-utils'
++
++import { Thread } from '.'
++
++stubThreadEnvironment()
++stubThreadViewportSize()
++let height = 2000
++Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, get: () => height })
++Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => 600 })
++
++const messages = (key: string, running: boolean): ThreadMessage[] => [
++  {
++    id: `u-${key}`,
++    role: 'user',
++    content: [{ type: 'text', text: `Synthetic task ${key}` }],
++    attachments: [],
++    createdAt: new Date('2026-01-01'),
++    metadata: { custom: {} }
++  },
++  {
++    id: `a-${key}`,
++    role: 'assistant',
++    content: [{ type: 'text', text: `Synthetic answer ${key}` }],
++    status: running ? { type: 'running' } : { type: 'complete', reason: 'stop' },
++    createdAt: new Date('2026-01-01'),
++    metadata: { unstable_state: null, unstable_annotations: [], unstable_data: [], steps: [], custom: {} }
++  }
++]
++
++function RunningMarker() {
++  const running = useAuiState(s => s.thread.isRunning)
++
++  return <output data-running={String(running)} data-testid="runtime-running" />
++}
++
++function Harness({ sessionKey, running }: { sessionKey: string; running: boolean }) {
++  const runtime = useExternalStoreRuntime<ThreadMessage>({
++    messages: messages(sessionKey, running),
++    isRunning: running,
++    onNew: async () => {}
++  })
++
++  return (
++    <AssistantRuntimeProvider runtime={runtime}>
++      <RunningMarker />
++      <Thread sessionId={sessionKey} sessionKey={sessionKey} />
++    </AssistantRuntimeProvider>
++  )
++}
++
++it('QA same mounted Thread preserves saved reading offset when switching from shorter A to running B before native resize', async () => {
++  window.localStorage.clear()
++  setActiveProfile('default')
++  rescopeConnectionScopedStores(null)
++  height = 2000
++  saveThreadScrollPosition('qa-boundary-B', { kind: 'offset', fromBottom: 800 })
++  expect(getThreadScrollPosition('qa-boundary-B')).toEqual({ kind: 'offset', fromBottom: 800 })
++  const original = globalThis.ResizeObserver
++  const observers = new Set<{ callback: ResizeObserverCallback; targets: Set<Element> }>()
++  vi.stubGlobal(
++    'ResizeObserver',
++    class {
++      targets = new Set<Element>()
++      constructor(public callback: ResizeObserverCallback) {
++        observers.add(this)
++      }
++      observe(target: Element) {
++        this.targets.add(target)
++      }
++      unobserve(target: Element) {
++        this.targets.delete(target)
++      }
++      disconnect() {
++        this.targets.clear()
++      }
++    }
++  )
++  const view = render(<Harness running={false} sessionKey="qa-boundary-A" />)
++  const viewport = view.container.querySelector<HTMLElement>('[data-slot="aui_thread-viewport"]')!
++
++  try {
++    await act(async () => {
++      for (let tick = 0; tick < 10; tick++) {
++        await new Promise(r => setTimeout(r, 0))
++      }
++    })
++    expect(viewport.scrollTop).toBe(1400)
++    const frame = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation(() => 0)
++
++    try {
++      height = 5000
++      view.rerender(<Harness running sessionKey="qa-boundary-B" />)
++      // The external-store runtime publishes updated running state asynchronously.
++      // Keep rAF parked, but require the real consumer to see running=true.
++      await act(async () => {
++        for (let tick = 0; tick < 3; tick++) {
++          await new Promise(r => setTimeout(r, 0))
++        }
++      })
++      expect(view.container.querySelector('[data-testid="runtime-running"]')?.getAttribute('data-running')).toBe('true')
++      const next = view.container.querySelector<HTMLElement>('[data-slot="aui_thread-viewport"]')!
++      expect(next).toBe(viewport) // Prove real DOM/Thread lifecycle reuse.
++      expect(next.scrollTop).toBe(3600) // Restore actually consumed B's saved 800px.
++      const before = next.scrollTop
++      act(() => {
++        next.dispatchEvent(new Event('scroll'))
++
++        for (const observer of observers) {
++          const targets = [...observer.targets].filter(t => t.getAttribute('data-slot') === 'aui_thread-content')
++
++          if (targets.length) {
++            observer.callback(
++              targets.map(target => ({ target, contentRect: { height } })) as ResizeObserverEntry[],
++              observer as unknown as ResizeObserver
++            )
++          }
++        }
++      })
++      console.log(
++        'QA_SESSION_BOUNDARY',
++        JSON.stringify({
++          sameViewport: next === viewport,
++          restoredTop: before,
++          afterResizeTop: next.scrollTop,
++          fromBottom: height - 600 - next.scrollTop
++        })
++      )
++      expect(next.scrollTop).toBe(3600)
++    } finally {
++      frame.mockRestore()
++    }
++  } finally {
++    view.unmount()
++    vi.stubGlobal('ResizeObserver', original)
++  }
++})
+diff --git a/apps/desktop/src/components/assistant-ui/thread/list-stream-resize-order.test.tsx b/apps/desktop/src/components/assistant-ui/thread/list-stream-resize-order.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..52edf06cef77b264bfc680356e933965f2e46876
+--- /dev/null
++++ b/apps/desktop/src/components/assistant-ui/thread/list-stream-resize-order.test.tsx
+@@ -0,0 +1,93 @@
++import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
++import { act, render } from '@testing-library/react'
++import { expect, it, vi } from 'vitest'
++
++import { stubThreadEnvironment, stubThreadViewportSize } from '../test-utils'
++
++import { Thread } from '.'
++
++stubThreadEnvironment()
++stubThreadViewportSize()
++
++const CLIENT_HEIGHT = 600
++let contentHeight = 5000
++
++Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, get: () => contentHeight })
++Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => CLIENT_HEIGHT })
++
++const createdAt = new Date('2026-01-01T00:00:00Z')
++
++const messages: ThreadMessage[] = [
++  { id: 'scroll-order-user', role: 'user', content: [{ type: 'text', text: 'Synthetic task' }], attachments: [], createdAt, metadata: { custom: {} } },
++  { id: 'scroll-order-assistant', role: 'assistant', content: [{ type: 'text', text: 'Synthetic streaming response' }], status: { type: 'running' }, createdAt, metadata: { unstable_state: null, unstable_annotations: [], unstable_data: [], steps: [], custom: {} } }
++]
++
++function Harness() {
++  const runtime = useExternalStoreRuntime<ThreadMessage>({ messages, isRunning: true, onNew: async () => {} })
++
++  return <AssistantRuntimeProvider runtime={runtime}><Thread sessionId="scroll-order-runtime" sessionKey="scroll-order" /></AssistantRuntimeProvider>
++}
++
++it('keeps the pre-growth resize baseline when the previous pin scroll event arrives before the next resize', async () => {
++  contentHeight = 5000
++  const original = globalThis.ResizeObserver
++  const observers = new Set<{ callback: ResizeObserverCallback; targets: Set<Element> }>()
++
++  vi.stubGlobal('ResizeObserver', class {
++    targets = new Set<Element>()
++    constructor(public callback: ResizeObserverCallback) { observers.add(this) }
++    observe(target: Element) { this.targets.add(target) }
++    unobserve(target: Element) { this.targets.delete(target) }
++    disconnect() { this.targets.clear() }
++  })
++
++  const { container, unmount } = render(<Harness />)
++  const viewport = container.querySelector<HTMLElement>('[data-slot="aui_thread-viewport"]')!
++
++  const resize = () => {
++    for (const observer of observers) {
++      const targets = [...observer.targets].filter(node => node.getAttribute('data-slot') === 'aui_thread-content')
++
++      if (targets.length) {
++        observer.callback(targets.map(target => ({ target, contentRect: { height: contentHeight } })) as ResizeObserverEntry[], observer as unknown as ResizeObserver)
++      }
++    }
++  }
++
++  try {
++    await act(async () => {
++      for (let tick = 0; tick < 10; tick++) {await new Promise(resolve => setTimeout(resolve, 0))}
++    })
++    expect(viewport.scrollTop).toBe(contentHeight - CLIENT_HEIGHT)
++    // Isolate the synchronous before-paint pin from the library's next rAF.
++    const frame = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation(() => 0)
++
++    try {
++      act(() => { contentHeight += 120; resize() })
++      expect(viewport.scrollTop).toBe(contentHeight - CLIENT_HEIGHT)
++
++      // A scroll event caused by that pin can be delivered after the next DOM
++      // growth but before its ResizeObserver. It is not a fresh resize sample.
++      act(() => {
++        contentHeight += 240
++        viewport.dispatchEvent(new Event('scroll'))
++        resize()
++      })
++      expect(viewport.scrollTop).toBe(contentHeight - CLIENT_HEIGHT)
++
++      // A genuine reader escape must still win over the same resize ordering.
++      const readingTop = viewport.scrollTop - 900
++      act(() => {
++        viewport.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -160 }))
++        viewport.scrollTop = readingTop
++        viewport.dispatchEvent(new Event('scroll'))
++        contentHeight += 400
++        resize()
++      })
++      expect(viewport.scrollTop).toBe(readingTop)
++    } finally { frame.mockRestore() }
++  } finally {
++    unmount()
++    vi.stubGlobal('ResizeObserver', original)
++  }
++})
+diff --git a/apps/desktop/src/components/assistant-ui/thread/list.tsx b/apps/desktop/src/components/assistant-ui/thread/list.tsx
+index 31fe6b5a9cf6fc718ff6a0cd756aefe9e8c79856..7a056fcd8ff989a50c2d15f6a5ed73cf9c0db197 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/list.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/list.tsx
+@@ -904,8 +904,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
+   // session's live state and must not file it under the new key).
+   const restoredContentKeyRef = useRef<string | null | undefined>(undefined)
+ 
+-  // eslint-disable-next-line no-restricted-syntax -- DOM-event cache (scroll/ResizeObserver callbacks), not an atom mirror
+-  useEffect(() => {
++  // Re-seed at transcript-owner commits, before native RO can treat the incoming session as old-session growth.
++  useLayoutEffect(() => {
+     const el = scrollRef.current
+     const content = contentRef.current
+ 
+@@ -920,13 +920,12 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
+     // paint.
+     const resizeMetrics = () => readThreadScrollResizeMetrics(el, clearanceRef.current)
+ 
+-    // ponytail: previous-metrics precision is load-bearing — the predicate must
+-    // see the frame BEFORE the growth, so a scroll event (which also writes it)
+-    // can't leave a stale gap that makes a mid-stream resize look like growth.
++    // Only ResizeObserver advances the resize baseline. A scroll event from
++    // our previous pin may arrive after new DOM growth but before its observer;
++    // sampling height there would hide that growth from the synchronous pin.
+     let previousResizeMetrics = resizeMetrics()
+ 
+     const update = () => {
+-      previousResizeMetrics = resizeMetrics()
+       liveScrollStateRef.current = threadScrollStateFromMetrics(el)
+     }
+ 
+@@ -962,7 +961,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
+       el.removeEventListener('scroll', update)
+       observer.disconnect()
+     }
+-  }, [contentRef, paneVisible, scrollRef])
++  }, [contentRef, hasGroups, paneVisible, scrollRef, scrollStorageKey, sessionKey])
+ 
+   // Persist the live position on app close, so a reading position survives a
+   // quit without a session switch (the switch cleanup below only runs on
+diff --git a/apps/desktop/src/test/scroll-continuity/fixture.tsx b/apps/desktop/src/test/scroll-continuity/fixture.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..35a65eb2bfad0c570bac3f446749761eb3b2c72f
+--- /dev/null
++++ b/apps/desktop/src/test/scroll-continuity/fixture.tsx
+@@ -0,0 +1,146 @@
++import '@/styles.css'
++
++// Synthetic data only. Production Thread, Markdown, resize observers, scroll owner,
++// runtime conversion and history reconciliation are imported, not reimplemented.
++import { AssistantRuntimeProvider, useAuiState, useExternalStoreRuntime } from '@assistant-ui/react'
++import { type CSSProperties, useCallback, useMemo, useRef, useState } from 'react'
++import { createRoot } from 'react-dom/client'
++
++import { reconcileAuthoritativeChatMessages } from '@/app/session/hooks/use-session-actions/resume-reconcile'
++import { Thread } from '@/components/assistant-ui/thread'
++import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
++import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
++import { toRuntimeMessage } from '@/lib/chat-runtime'
++import { requestScrollToBottom, saveThreadScrollPosition } from '@/store/thread-scroll'
++
++// Schedule the already-observed browser ordering deterministically. Only the
++// pending scroll event is synthetic; message layout and ResizeObserver are real.
++function appendBeforeDelayedScroll(rows: ChatMessage[], append: () => void, delivered: { current: number }) {
++  const target = document.querySelector<HTMLElement>(`[data-message-id="${rows.at(-1)!.id}"]`)!
++  const viewport = target.closest<HTMLElement>('[data-slot="aui_thread-viewport"]')!
++  const before = target.textContent
++
++  const observer = new MutationObserver(() => {
++    if (target.textContent !== before) {
++      observer.disconnect()
++      delivered.current += 1
++      viewport.dispatchEvent(new Event('scroll'))
++    }
++  })
++
++  observer.observe(target, { childList: true, characterData: true, subtree: true })
++  append()
++}
++
++const PROSE = 'Synthetic continuity sample. This is a stable paragraph used to measure a real message, not a private conversation. '
++const TIMESTAMP = 1767225600
++
++function makeMessages(turns = 18, repeats = 5, start = 0): ChatMessage[] {
++  return Array.from({ length: turns }, (_, offset) => {
++    const index = start + offset
++
++    return [
++      { id: `u-${index}`, role: 'user', parts: [{ type: 'text', text: `Synthetic task ${index}` }], rowId: index * 2, timestamp: TIMESTAMP },
++      { id: `a-${index}`, role: 'assistant', parts: [{ type: 'text', text: `Answer ${index}.\n\n${PROSE.repeat(repeats)}` }], rowId: index * 2 + 1, timestamp: TIMESTAMP }
++    ] as ChatMessage[]
++  }).flat()
++}
++
++function extend(row: ChatMessage, count: number): ChatMessage {
++  return { ...row, parts: [{ type: 'text', text: `${chatMessageText(row)}\n\n${PROSE.repeat(count)}` }] }
++}
++
++function RunningMarker() {
++  const running = useAuiState(state => state.thread.isRunning)
++
++  return <output data-runtime-running={String(running)} hidden />
++}
++
++function Probe() {
++  const [rows, setRows] = useState(makeMessages)
++  const [running, setRunning] = useState(false)
++  const [sessionKey, setSessionKey] = useState('synthetic-scroll')
++  const [olderAvailable, setOlderAvailable] = useState(false)
++  const saved = useRef<ChatMessage[]>([])
++  const delayedScrollDelivered = useRef(0)
++  const runtimeRows = useMemo(() => rows.map(toRuntimeMessage), [rows])
++  const runtime = useExternalStoreRuntime({ messages: runtimeRows, isRunning: running, onNew: async () => {} })
++
++  const expandWindow = useCallback(async (before?: () => void) => {
++    await new Promise(resolve => setTimeout(resolve, 100))
++    before?.()
++    setRows(previous => [...makeMessages(3, 5, -3), ...previous])
++    setOlderAvailable(false)
++
++    return true
++  }, [])
++
++  window.probe = {
++    ownerA: () => { setRunning(true); setSessionKey('synthetic-owner-A'); setRows(makeMessages(4, 5, 1000)) },
++    ownerB: () => {
++      saveThreadScrollPosition('synthetic-owner-B', { kind: 'offset', fromBottom: 800 })
++      setRunning(true)
++      setSessionKey('synthetic-owner-B')
++      setRows(makeMessages(4, 5, 2000))
++    },
++    appendBeforeDelayedScroll: () => appendBeforeDelayedScroll(rows, () => setRows(previous => previous.map((row, index) => index === previous.length - 1 ? extend(row, 3) : row)), delayedScrollDelivered),
++    delayedScrollDelivered: () => delayedScrollDelivered.current,
++    append: (count = 3) => setRows(previous => previous.map((row, index) => index === previous.length - 1 ? extend(row, count) : row)),
++    empty: () => { saved.current = rows; setRows([]) },
++    enableHistory: () => setOlderAvailable(true),
++    grow: (rowId: number) => setRows(previous => previous.map(row => row.rowId === rowId ? extend(row, 12) : row)),
++    heavy: () => { setRunning(false); setSessionKey('synthetic-heavy'); setRows(makeMessages(100, 40)) },
++    hydrate: () => setRows(previous => previous.map(row => ({ ...row, parts: [...row.parts] }))),
++    identity: (id: string) => rows.find(row => row.id === id)?.rowId,
++    jump: () => requestScrollToBottom('synthetic-runtime'),
++    nextTurn: () => setRows(previous => [...previous, ...makeMessages(1, 5, previous.length / 2)]),
++    reconcile: () => setRows(previous => reconcileAuthoritativeChatMessages(previous.map(row => ({ ...row, id: `hydrated-${row.rowId}`, parts: [...row.parts] })), previous)),
++    reset: () => { setRunning(false); setSessionKey('synthetic-scroll'); setRows(makeMessages()) },
++    restore: () => setRows(saved.current),
++    rows: () => rows,
++    start: () => setRunning(true),
++    stop: () => setRunning(false)
++  }
++
++  return (
++    <AssistantRuntimeProvider runtime={runtime}>
++      <RunningMarker />
++      <TranscriptWindowProvider value={{ olderAvailable, expandWindow }}>
++        <header style={{ height: 48, padding: 12 }}>SYNTHETIC · real Thread component · no backend / no user data</header>
++        {/* Fixed synthetic row geometry isolates owner changes from deferred Markdown/backfill. */}
++        <style>{'[data-probe-owner="synthetic-owner-A"] [data-slot="aui_message-group"] { min-height: 500px; } [data-probe-owner="synthetic-owner-B"] [data-slot="aui_message-group"] { min-height: 1250px; }'}</style>
++        <div data-chat-surface="" data-probe-owner={sessionKey} style={{ height: 'calc(100vh - 48px)', '--titlebar-height': '0px', '--composer-width': '800px' } as CSSProperties}>
++          <Thread sessionId="synthetic-runtime" sessionKey={sessionKey} />
++        </div>
++      </TranscriptWindowProvider>
++    </AssistantRuntimeProvider>
++  )
++}
++
++declare global {
++  interface Window {
++    probe: {
++      ownerA: () => void
++      ownerB: () => void
++      appendBeforeDelayedScroll: () => void
++      delayedScrollDelivered: () => number
++      append: (count?: number) => void
++      empty: () => void
++      enableHistory: () => void
++      grow: (rowId: number) => void
++      heavy: () => void
++      hydrate: () => void
++      identity: (id: string) => number | undefined
++      jump: () => void
++      nextTurn: () => void
++      reconcile: () => void
++      reset: () => void
++      restore: () => void
++      rows: () => ChatMessage[]
++      start: () => void
++      stop: () => void
++    }
++  }
++}
++
++createRoot(document.getElementById('root')!).render(<Probe />)
+diff --git a/contrib/scroll-continuity/README.md b/contrib/scroll-continuity/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..352e50adc008c128a437923bb9e7ba23f6dca333
+--- /dev/null
++++ b/contrib/scroll-continuity/README.md
+@@ -0,0 +1,23 @@
++# Bounded scroll-continuity probe (synthetic, not installed-client acceptance)
++
++Run from the repository root with existing Desktop workspace dependencies and the matching Playwright headless Chromium already prepared:
++
++```sh
++node contrib/scroll-continuity/browser.mjs /absolute/task-owned/evidence
++```
++
++This uses the **unmodified official Vite configuration**, production Thread/Markdown/CSS, native ResizeObserver/IntersectionObserver and scroll owner, real `reconcileAuthoritativeChatMessages` and `toRuntimeMessage`. The HTML entry is `apps/desktop/scroll-probe.html`. No backend starts, no model is called, and no private conversation/config/database is read. The plain-text snapshot and delayed history-page producer are explicitly synthetic. This does not emulate wire reconnect/ordering or prove Electron/Windows adoption.
++
++Seventeen stable case IDs cover bottom growth, genuine wheel escape, reading anchors, repeated real source reconciliation with durable identities, completion, same-key empty/reload restoration, asynchronous Show-earlier prepend, variable row height after the reader takes ownership, explicit jump/resumed following, a render-budgeted next-turn control, and successive content-resize observer samples reaching the bottom before the next frame. The history button is invoked through its DOM click handler without Playwright scrolling it into view, so the test does not confuse deliberate navigation to the button with preservation of the prior reading anchor.
++
++`frames.json` contains rAF and content-ResizeObserver samples (distinguished by `phase`) with viewport/scrollTop/scrollHeight, following state and on-screen logical rowId/renderer-id/geometry. The observer tracks **outer groups**; it never asks skipped off-screen message descendants for layout. Samples are diagnostic, not proof that every sample was painted. `results.json` contains exact case outcomes and settled snapshots. Raw screenshots are 1440x960. Browser and Vite exit in `finally` on success and failure.
++
++The cold same-key reload first mounts a bounded tail and backfills. Its oracle waits for the remembered logical anchor to become reachable (10-second failure bound), rather than interpreting a fixed one-second in-progress snapshot as settled failure. It does **not** claim zero transient loading displacement. Existing post-restore frozen-distance behavior intentionally preserves from-bottom through late layout until real user input; a genuine wheel gesture precedes the independent variable-height oracle.
++
++The repair is deliberately local: only the content ResizeObserver advances its previous-size baseline. A delayed scroll event caused by the previous bottom pin must not consume the next DOM growth before that growth's ResizeObserver. A natural baseline trace exposed this ordering, while another natural retry did not (it is timing-dependent). The browser fixture therefore has a controlled actor: it appends real text, then delivers one synthetic pending `scroll` from a MutationObserver after that DOM text changes and before the native ResizeObserver. It checks that this actor actually delivered once; no scrollHeight, clientHeight, layout, resize callback or model/backend output is fabricated. The same final browser case is red on baseline and green on the candidate.
++
++`list-stream-resize-order.test.tsx` independently makes that ordering deterministic with the real Thread component under the existing jsdom harness; its geometry/RO are explicit stubs, unlike the browser. It also asserts that genuine wheel escape still wins. The production fix removes one height-sampling assignment from the scroll callback, adds no new owner/state/ordering protocol, and leaves the existing library follow path intact. Its live observer is re-created in a layout effect on session/profile storage-owner changes and empty-to-loaded content: a baseline from a shorter outgoing transcript must not mistake the restored incoming running transcript for stream growth. Rebinding during the commit prevents a native RO from running against an old owner's dimensions before passive effects.
++
++Three additional `owner-switch-*` IDs are a separate cohort, not extra executions of the original seventeen. They use the same mounted viewport/content and a real running-state marker, with synthetic four-row minimum heights of 500px in A and 1250px in B to make incoming geometry available at commit time. This explicit fixture CSS does not claim organic Markdown/backfill timing coverage. A is already running before switching to running B; the colocated `list-session-resize-owner.test.tsx` separately waits for real runtime publication in the idle-A to running-B case. B has a remembered 800px reading gap. A MutationObserver watching the committed owner attribute delivers one synthetic pending scroll before native RO, and the native-RO samples must retain 800px. `owner-frames.json` records same viewport/content identity, actual running state, content height and before/after geometry; dimensions and resize callbacks remain native. On the first candidate without owner rebinding this case is red (800px becomes 0), while the revised candidate stays at 800px. This fixture's fixed-row whitespace is intentional test geometry, not production UI styling.
++
++The inherited commentary-reconciliation patch is separate provenance, not authored by this probe. The original user occurrence and installed Windows client still need their existing QA owner/window; this is not proof of adoption or unique incident attribution.
+diff --git a/contrib/scroll-continuity/browser.mjs b/contrib/scroll-continuity/browser.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c49aa4aa837a31ca75044bb7c3ba9bae0ff3266
+--- /dev/null
++++ b/contrib/scroll-continuity/browser.mjs
+@@ -0,0 +1,213 @@
++import assert from 'node:assert/strict'
++import { mkdirSync, writeFileSync } from 'node:fs'
++import { createRequire } from 'node:module'
++import { resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++const require = createRequire(import.meta.url)
++const { chromium } = require('playwright-core')
++const { createServer } = await import('vite')
++const repo = fileURLToPath(new URL('../..', import.meta.url))
++const output = resolve(process.argv[2] || 'artifacts/scroll-continuity')
++mkdirSync(output, { recursive: true })
++const server = await createServer({ root: resolve(repo, 'apps/desktop'), configFile: resolve(repo, 'apps/desktop/vite.config.ts'), server: { port: 0, strictPort: false }, cacheDir: resolve(repo, 'node_modules/.vite-scroll') })
++const errors = [], results = [], snapshots = []
++let browser, page
++const check = (id, fn) => {
++  try { fn(); results.push({ id, passed: true }); console.log(`PASS ${id}`) }
++  catch (e) { results.push({ id, passed: false, error: String(e) }); console.log(`FAIL ${id}: ${e}`) }
++}
++const idle = async (ms = 300) => page.waitForTimeout(ms)
++const snap = async label => {
++  const s = await page.evaluate(() => window.scrollProbe.measure())
++  snapshots.push({ label, ...s })
++  return s
++}
++const sameAnchor = (before, after) => {
++  const anchor = before.visible.find(row => row.role === 'assistant' && row.top >= 0)
++  assert.ok(anchor, 'expected an on-screen assistant anchor')
++  const next = after.visible.find(row => row.rowId === anchor.rowId)
++  assert.ok(next, `anchor row ${anchor.rowId} survived`)
++  assert.ok(Math.abs(next.top - anchor.top) <= 2, `anchor ${anchor.rowId} moved ${next.top - anchor.top}px`)
++}
++try {
++  await server.listen()
++  browser = await chromium.launch({ headless: true })
++  page = await browser.newPage({ viewport: { width: 1440, height: 960 }, reducedMotion: 'no-preference' })
++  page.on('pageerror', e => errors.push(String(e)))
++  await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/scroll-probe.html`, { timeout: 90000 })
++  await page.waitForSelector('[data-slot="aui_assistant-message-root"]', { timeout: 90000 })
++  await idle(1800)
++  // Observe outer groups. Never measure descendants of skipped/off-screen groups:
++  // that would wake content-visibility and alter the scroll behavior being tested.
++  await page.evaluate(() => {
++    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
++    const visible = new Set(), observed = new Set(), frames = []
++    let label = 'initial', stopped = false, frame
++    const observer = new IntersectionObserver(entries => {
++      for (const entry of entries) entry.isIntersecting ? visible.add(entry.target) : visible.delete(entry.target)
++    }, { root: viewport })
++    const reconcile = () => {
++      for (const group of viewport.querySelectorAll('[data-slot="aui_message-group"]')) {
++        if (!observed.has(group)) { observed.add(group); observer.observe(group) }
++      }
++      for (const group of observed) if (!group.isConnected) { observed.delete(group); visible.delete(group); observer.unobserve(group) }
++    }
++    const mutations = new MutationObserver(reconcile)
++    mutations.observe(viewport, { childList: true, subtree: true })
++    reconcile()
++    const measure = () => {
++      const rect = viewport.getBoundingClientRect()
++      return { top: viewport.scrollTop, height: viewport.scrollHeight, client: viewport.clientHeight, gap: viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop, following: viewport.dataset.following, visible: [...visible].filter(n => n.isConnected).flatMap(group => [...group.querySelectorAll('[data-message-id]')].map(node => ({ id: node.dataset.messageId, rowId: window.probe.identity(node.dataset.messageId), role: node.dataset.slot?.includes('assistant') ? 'assistant' : 'user', top: node.getBoundingClientRect().top - rect.top, bottom: node.getBoundingClientRect().bottom - rect.top }))).filter(row => row.bottom > 0 && row.top < rect.height).sort((a,b) => a.rowId - b.rowId) }
++    }
++    const resizeFrames = []
++    const paintFrontier = new ResizeObserver(() => {
++      queueMicrotask(() => resizeFrames.push({ label, at: performance.now(), phase: 'resize-observer', ...measure() }))
++    })
++    paintFrontier.observe(viewport.querySelector('[data-slot="aui_thread-content"]'))
++    const sample = () => { if (!stopped) { frames.push({ label, at: performance.now(), phase: 'raf', ...measure() }); frame = requestAnimationFrame(sample) } }
++    frame = requestAnimationFrame(sample)
++    window.scrollProbe = { measure, label: value => { label = value }, finish: () => { stopped = true; cancelAnimationFrame(frame); observer.disconnect(); paintFrontier.disconnect(); mutations.disconnect(); return [...frames, ...resizeFrames].sort((a,b) => a.at - b.at) } }
++  })
++  await idle(100)
++  const initial = await snap('loaded')
++  check('initial-bottom', () => assert.ok(Math.abs(initial.gap) <= 2))
++  await page.evaluate(() => { window.scrollProbe.label('stream-bottom'); window.probe.start() })
++  for (let n = 0; n < 6; n++) { await page.evaluate(() => window.probe.append(3)); await idle(35) }
++  await idle(); const bottom = await snap('stream-bottom')
++  check('stream-bottom-follow', () => { assert.ok(Math.abs(bottom.gap) <= 2); assert.equal(bottom.following, 'true') })
++  await page.evaluate(() => { window.scrollProbe.label('ordered-stream-pin'); window.probe.appendBeforeDelayedScroll() })
++  await page.waitForFunction(() => window.probe.delayedScrollDelivered() === 1)
++  await idle(400)
++  await snap('ordered-stream-pin')
++  await page.screenshot({ path: `${output}/bottom.png` })
++  await page.evaluate(() => window.scrollProbe.label('user-wheel'))
++  await page.locator('[data-slot="aui_thread-viewport"]').hover()
++  await page.mouse.wheel(0, -1100); await idle(700)
++  const reading = await snap('reading')
++  check('user-wheel-escapes', () => { assert.ok(reading.gap > 500); assert.equal(reading.following, 'false') })
++  await page.evaluate(() => window.scrollProbe.label('stream-reading'))
++  for (let n = 0; n < 6; n++) { await page.evaluate(() => window.probe.append(3)); await idle(35) }
++  await idle(); const appended = await snap('stream-reading')
++  check('stream-keeps-reading-anchor', () => sameAnchor(reading, appended))
++  await page.evaluate(() => { window.scrollProbe.label('hydrate'); window.probe.hydrate() }); await idle()
++  const hydrated = await snap('hydrate')
++  check('same-identity-hydration', () => sameAnchor(appended, hydrated))
++  await page.evaluate(() => window.scrollProbe.label('reconcile'))
++  for (let n = 0; n < 3; n++) { await page.evaluate(() => window.probe.reconcile()); await idle(150) }
++  const reconciled = await snap('real-source-reconcile')
++  check('repeated-source-reconcile', () => sameAnchor(hydrated, reconciled))
++  check('source-reconcile-no-extra-occurrences', () => assert.equal(reconciled.visible.length, hydrated.visible.length))
++  await page.evaluate(() => window.probe.stop()); await idle()
++  const completed = await snap('complete')
++  check('completion-keeps-reading', () => sameAnchor(reconciled, completed))
++  await page.evaluate(() => { window.scrollProbe.label('empty-reload'); window.probe.empty() }); await idle(100)
++  await page.evaluate(() => window.probe.restore())
++  // A cold same-key restore first paints a bounded tail, then backfills. It is
++  // not a settled reading position until the remembered anchor is reachable.
++  await page.waitForFunction(expected => window.scrollProbe.measure().visible.some(row => row.rowId === expected.rowId && Math.abs(row.top - expected.top) <= 2), completed.visible.find(row => row.role === 'assistant' && row.top >= 0), { timeout: 10000 })
++  await idle(200)
++  const reload = await snap('same-session-empty-reload')
++  check('same-session-empty-reload', () => sameAnchor(completed, reload))
++  await page.screenshot({ path: `${output}/reading.png` })
++  await page.evaluate(() => { window.scrollProbe.label('history-prepend'); window.probe.enableHistory() }); await idle(100)
++  const preHistory = await snap('before-history')
++  // Exercise the production Show-earlier handler without browser click's
++  // scroll-into-view (which intentionally changes the chosen reading position).
++  await page.locator('[data-slot="aui_thread-viewport"]').getByRole('button', { name: 'Show earlier messages', exact: true }).evaluate(node => node.click())
++  await idle(1000); const history = await snap('history-prepend')
++  check('async-history-prepend-anchor', () => sameAnchor(preHistory, history))
++  // The just-restored frozen distance intentionally tracks late layout until
++  // real input. Give reading ownership back before testing native row growth.
++  await page.locator('[data-slot="aui_thread-viewport"]').hover()
++  await page.mouse.wheel(0, -80); await idle(350)
++  const beforeGrowth = await snap('reader-before-variable-height')
++  const growRow = beforeGrowth.visible.find(row => row.role === 'assistant' && row.top >= 0)
++  const nextRow = beforeGrowth.visible.find(row => row.role === 'assistant' && row.rowId > growRow.rowId)
++  await page.evaluate(rowId => { window.scrollProbe.label('variable-height'); window.probe.grow(rowId) }, growRow.rowId)
++  await idle(700); const grown = await snap('variable-height')
++  check('growing-visible-row-keeps-leading-edge', () => sameAnchor(beforeGrowth, grown))
++  check('following-content-moves-by-real-growth', () => {
++    const row = grown.visible.find(row => row.rowId === growRow.rowId)
++    assert.ok(row.bottom - row.top > growRow.bottom - growRow.top + 100)
++    assert.ok(nextRow, 'fixture exposes a neighboring assistant before growth')
++    const next = grown.visible.find(row => row.rowId === nextRow.rowId)
++    assert.ok(next, 'neighbor remains measurable after growth')
++    const heightDelta = row.bottom - row.top - (growRow.bottom - growRow.top)
++    assert.ok(Math.abs(next.top - nextRow.top - heightDelta) <= 2, 'neighbor moves by the actual added height')
++  })
++  await page.evaluate(() => { window.scrollProbe.label('explicit-jump'); window.probe.jump() }); await idle(700)
++  const jump = await snap('jump')
++  check('explicit-jump-to-bottom', () => assert.ok(Math.abs(jump.gap) <= 2))
++  await page.evaluate(() => { window.probe.start(); window.probe.append(8) }); await idle(500)
++  const followed = await snap('follow-after-jump')
++  check('follow-resumes-after-jump', () => assert.ok(Math.abs(followed.gap) <= 2))
++  // Same mounted viewport, different running transcript. A is already running
++  // so this browser cohort isolates owner identity from async runtime startup;
++  // the component regression separately covers A idle -> B running publication.
++  await page.evaluate(() => { window.scrollProbe.label('owner-A'); window.probe.ownerA() })
++  await page.waitForFunction(() => document.querySelector('[data-runtime-running]')?.dataset.runtimeRunning === 'true')
++  await idle(800)
++  const ownerA = await snap('owner-A')
++  await page.evaluate(() => {
++    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
++    const beforeHeight = viewport.scrollHeight
++    const content = viewport.querySelector('[data-slot="aui_thread-content"]')
++    const samples = []
++    let delivered = false
++    const measure = phase => samples.push({ phase, top: viewport.scrollTop, height: viewport.scrollHeight, contentHeight: content.getBoundingClientRect().height, sameContent: content === viewport.querySelector('[data-slot="aui_thread-content"]'), client: viewport.clientHeight, gap: viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop, running: document.querySelector('[data-runtime-running]')?.dataset.runtimeRunning, sameViewport: viewport === document.querySelector('[data-slot="aui_thread-viewport"]') })
++    const mutations = new MutationObserver(() => {
++      if (viewport.scrollHeight <= beforeHeight + 1000) return
++      mutations.disconnect()
++      delivered = true
++      measure('before-delayed-scroll')
++      viewport.dispatchEvent(new Event('scroll'))
++      measure('after-delayed-scroll')
++    })
++    mutations.observe(viewport.closest('[data-chat-surface]'), { attributes: true, attributeFilter: ['data-probe-owner'], childList: true, characterData: true, subtree: true })
++    const observer = new ResizeObserver(() => { queueMicrotask(() => measure(delivered ? 'resize-observer' : 'resize-before-mutation')) })
++    observer.observe(viewport.querySelector('[data-slot="aui_thread-content"]'))
++    window.ownerProbe = { finish: () => { observer.disconnect(); mutations.disconnect(); return samples } }
++    window.scrollProbe.label('owner-B')
++    window.probe.ownerB()
++  })
++  await idle(800)
++  const ownerB = await snap('owner-B')
++  const ownerSamples = await page.evaluate(() => window.ownerProbe.finish())
++  writeFileSync(`${output}/owner-frames.json`, JSON.stringify({ ownerA, ownerB, samples: ownerSamples }, null, 2))
++  check('owner-switch-real-running-same-viewport', () => {
++    assert.ok(ownerB.height > ownerA.height + 1000)
++    assert.ok(ownerSamples.length >= 3)
++    assert.ok(ownerSamples.every(sample => sample.sameViewport && sample.running === 'true'))
++  })
++  check('owner-switch-restores-before-delayed-scroll', () => {
++    const before = ownerSamples.find(sample => sample.phase === 'before-delayed-scroll')
++    assert.ok(before, 'observed incoming real DOM before native RO')
++    assert.ok(Math.abs(before.gap - 800) <= 2, `restored gap ${before.gap}`)
++  })
++  check('owner-switch-retains-reading-through-native-resize', () => {
++    const samples = ownerSamples.filter(sample => sample.phase === 'resize-observer')
++    assert.ok(samples.length >= 1)
++    assert.ok(samples.every(sample => Math.abs(sample.gap - 800) <= 2), `native RO gaps ${samples.map(sample => sample.gap).join(',')}`)
++    assert.ok(Math.abs(ownerB.gap - 800) <= 2, `settled gap ${ownerB.gap}`)
++  })
++  await page.screenshot({ path: `${output}/owner-reading.png` })
++  await page.evaluate(() => { window.scrollProbe.label('heavy-load'); window.probe.heavy() }); await idle(1800)
++  await snap('heavy-load')
++  await page.locator('[data-slot="aui_thread-viewport"]').hover(); await page.mouse.wheel(0,-1300); await idle(700)
++  const heavyReading = await snap('heavy-reading')
++  await page.evaluate(() => { window.scrollProbe.label('heavy-next-turn'); window.probe.nextTurn() }); await idle(500)
++  const heavyNext = await snap('heavy-next-turn')
++  check('budgeted-next-turn-keeps-reading', () => sameAnchor(heavyReading, heavyNext))
++  await page.screenshot({ path: `${output}/heavy.png` })
++  check('no-render-exceptions', () => assert.deepEqual(errors, []))
++  const frames = await page.evaluate(() => window.scrollProbe.finish())
++  check('stream-pin-reaches-bottom-in-resize-observer', () => {
++    const resizeSamples = frames.filter(frame => frame.label === 'ordered-stream-pin' && frame.phase === 'resize-observer')
++    assert.ok(resizeSamples.length >= 1, 'observed the real content resize after the controlled delayed scroll')
++    assert.ok(resizeSamples.every(frame => Math.abs(frame.gap) <= 2), `remaining gaps: ${resizeSamples.map(frame => frame.gap).join(',')}`)
++  })
++  writeFileSync(`${output}/frames.json`, JSON.stringify(frames))
++  writeFileSync(`${output}/results.json`, JSON.stringify({ viewport: { width:1440,height:960 }, reducedMotion:'no-preference', results, snapshots, errors, frameCount:frames.length }, null, 2))
++  console.log(JSON.stringify({ cases:results.length, passed:results.filter(x=>x.passed).length, failed:results.filter(x=>!x.passed).length, frames:frames.length }))
++  if (results.some(x => !x.passed)) process.exitCode = 1
++} finally { await browser?.close(); await server.close(); console.log('CLEANUP browser and Vite server closed') }
