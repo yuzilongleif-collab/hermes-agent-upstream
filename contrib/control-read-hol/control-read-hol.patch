@@ -1,0 +1,823 @@
+diff --git a/tests/gateway/fixtures/control_read_lifetime_cases.py b/tests/gateway/fixtures/control_read_lifetime_cases.py
+new file mode 100644
+index 00000000..e53f8057
+--- /dev/null
++++ b/tests/gateway/fixtures/control_read_lifetime_cases.py
+@@ -0,0 +1,146 @@
++"""Real TCP disconnect/shutdown probes; wrappers only observe the native paths."""
++import asyncio
++import json
++import threading
++
++from tests.waiting import async_wait_until
++
++
++class ConnectionWatch:
++    def __init__(self):
++        from tui_gateway import ws
++        self.module = ws
++        self.original = ws.handle_ws
++        self.connections = []
++        ws.handle_ws = self.handle
++
++    async def handle(self, socket, **kwargs):
++        row = {'task': asyncio.current_task(), 'done': asyncio.Event(), 'received': []}
++        self.connections.append(row)
++        original_receive = socket.receive_text
++
++        async def receive():
++            raw = await original_receive()
++            row['received'].append(json.loads(raw))
++            return raw
++
++        socket.receive_text = receive
++        try:
++            return await self.original(socket, **kwargs)
++        finally:
++            row['done'].set()
++
++    def close(self):
++        self.module.handle_ws = self.original
++
++
++async def lifetime_case(authority, replies, a, b, record, mode, watcher):
++    from gateway import session_ancillary as ancillary
++    from gateway import session_policy_refresh as refresh
++    entered = asyncio.Event()
++    pending = asyncio.get_running_loop().create_future()
++    authority._policy_refreshes = {a: pending}
++    original_refresh, original_read = refresh.refresh_settled, ancillary.read
++    calls = []
++
++    async def observed_refresh(owner, sid):
++        if owner is authority and sid == a:
++            entered.set()
++        return await original_refresh(owner, sid)
++
++    async def observed_read(connection, ref, params, **kwargs):
++        calls.append(ref.session_id)
++        return await original_read(connection, ref, params, **kwargs)
++
++    refresh.refresh_settled, ancillary.read = observed_refresh, observed_read
++    connection = watcher.connections[0]
++    try:
++        await replies.send('blocked-resume', 'session.resume', session_id=a, omit_messages=True)
++        await asyncio.wait_for(entered.wait(), 5)
++        if mode == 'cancel-flood':
++            from tui_gateway.ws import _WS_CONCURRENT_READ_LIMIT, _WS_WAITING_READ_LIMIT
++            limit = _WS_CONCURRENT_READ_LIMIT + _WS_WAITING_READ_LIMIT
++            for index in range(limit * 3):
++                await replies.send('waiting-' + str(index), 'session.control.read', session_id=a)
++            # The limit+1 frame is read and then parks admission; no later frame can be read.
++            await async_wait_until(lambda: len([r for r in connection['received']
++                                                if str(r.get('id', '')).startswith('waiting-')]) == limit + 1,
++                                   timeout=5, what='native bounded reader parked at admission')
++            assert not calls, calls
++            connection['task'].cancel()
++            await asyncio.wait_for(connection['done'].wait(), 5)
++            assert not pending.done(), 'cancelling a socket cancelled the shared policy refresh'
++            record.update(read_admission_bound=limit, unstarted_reads_dropped=True, server_cancel_exited=True)
++        else:
++            await replies.send('waiting-control', 'session.control.read', session_id=a)
++            await replies.send('successor-info', 'session.info', session_id=a)
++            assert (await replies.call('before-disconnect', 'gateway.ping'))['result']['ok']
++            await replies.ws.close()
++            assert not connection['done'].is_set(), 'disconnect closed authority under a running resume'
++            pending.set_result(None)
++            await asyncio.wait_for(connection['done'].wait(), 10)
++            assert not calls, 'a control read waiting for its predecessor ran after disconnect'
++            record.update(disconnect_drained=True, unstarted_reads_dropped=True)
++    finally:
++        if not pending.done():
++            pending.set_result(None)
++        refresh.refresh_settled, ancillary.read = original_refresh, original_read
++        authority._policy_refreshes.pop(a, None)
++
++
++async def permission_case(authority, replies, a, record):
++    from tests.gateway.test_sibling_attach_while_profile_starting import _Socket
++    from tui_gateway.ws import handle_ws
++    sock = _Socket(authority)
++    task = asyncio.create_task(handle_ws(sock, auth_identity={
++        'user_id': 'unprivileged', 'profile_id': authority.profile_id, 'capabilities': []}))
++    try:
++        sock.inbound.put_nowait({'jsonrpc': '2.0', 'id': 'denied', 'method': 'session.control.read',
++                                'params': {'session_id': a}})
++        denied = await sock.reply('denied', timeout=5)
++        assert denied['error']['message'] == 'permission_denied', denied
++    finally:
++        sock.inbound.put_nowait(None)
++        await asyncio.wait_for(task, 10)
++    for rid, params, expected in [
++        ('foreign', {'session_id': a, 'profile': 'foreign'}, 'profile_mismatch'),
++        ('injected', {'session_id': a, 'user_id': 'owner'}, 'invalid_params'),
++        ('missing', {'session_id': 'absent-session'}, 'not_found'),
++    ]:
++        response = await replies.call(rid, 'session.control.read', **params)
++        assert response['error']['message'] == expected, response
++    valid = await replies.call('after-rejections', 'session.control.read', session_id=a)
++    assert 'result' in valid, valid
++    record.update(capability_denied=True, profile_denied=True, invalid_params_denied=True,
++                  not_found_preserved=True, rejection_fences_released=True)
++
++
++async def started_disconnect_case(authority, replies, second, a, record, watcher):
++    original = authority.db.get_compression_tip
++    entered, release, exited = threading.Event(), threading.Event(), threading.Event()
++
++    def observed(sid, *args, **kwargs):
++        if sid == a and threading.current_thread() is not threading.main_thread():
++            entered.set()
++            try:
++                assert release.wait(15), 'started control worker watchdog expired'
++            finally:
++                exited.set()
++        return original(sid, *args, **kwargs)
++
++    authority.db.get_compression_tip = observed
++    try:
++        await replies.send('started-control', 'session.control.read', session_id=a)
++        await async_wait_until(entered.is_set, timeout=5, what='started control worker')
++        await replies.ws.close()
++        assert not watcher.connections[0]['done'].is_set(), 'teardown ran underneath a started read'
++        assert (await second.call('started-disconnect-ping', 'gateway.ping'))['result']['ok']
++        release.set()
++        await asyncio.wait_for(watcher.connections[0]['done'].wait(), 10)
++        assert exited.is_set()
++        record.update(started_read_drained=True, paused_worker_exited=True, peer_ping_during_drain=True)
++    finally:
++        release.set()
++        authority.db.get_compression_tip = original
++        if entered.is_set():
++            await async_wait_until(exited.is_set, timeout=5, what='started control worker exited')
+diff --git a/tests/gateway/fixtures/control_read_ordering_cases.py b/tests/gateway/fixtures/control_read_ordering_cases.py
+new file mode 100644
+index 00000000..b86c3ef2
+--- /dev/null
++++ b/tests/gateway/fixtures/control_read_ordering_cases.py
+@@ -0,0 +1,155 @@
++"""Ordering assertions through the peer's real WS/authority handlers."""
++import asyncio
++import threading
++
++from tests.waiting import async_wait_until
++
++
++async def remains_pending(future):
++    done, _ = await asyncio.wait({future}, timeout=2)
++    assert not done, 'request overtook an earlier overlapping request'
++
++
++def compressed_target(authority, owner):
++    from tests.gateway.test_local_resume_compression_child import _compress
++    live = authority.sessions[owner]
++    store = authority.runner.session_store
++    store._record_gateway_session_peer(owner, live.route, live.source)
++    child = 'ordering-physical-child'
++    _compress(authority.db, owner, child, 'local')
++    store._record_gateway_session_peer(child, live.route, live.source)
++    return child
++
++
++async def resume_case(authority, replies, a, b, record, mode):
++    from gateway import session_policy_refresh as refresh
++    from gateway.session_control_actions import publish_async
++    from hermes_cli.goals import GoalState
++    requested = a[:22] if mode == 'resume-short' else a
++    if mode == 'resume-lineage':
++        requested = compressed_target(authority, a)
++    refreshing = requested if mode == 'resume-lineage' else a
++    original = refresh.refresh_settled
++    entered = asyncio.Event()
++    pending = asyncio.get_running_loop().create_future()
++    authority._policy_refreshes = {refreshing: pending}
++
++    async def observed(owner, sid):
++        if owner is authority and sid == refreshing:
++            entered.set()
++        return await original(owner, sid)
++
++    refresh.refresh_settled = observed
++    try:
++        resume = await replies.send('resume', 'session.resume', session_id=requested, omit_messages=True)
++        await asyncio.wait_for(entered.wait(), 5)
++        target = b if mode == 'resume-other' else a
++        control = await replies.send('ordered', 'session.control.read', session_id=target)
++        ping = await replies.call('resume-ping', 'gateway.ping')
++        assert ping['result']['ok']
++        await remains_pending(control)
++        pending.set_result(None)
++        resumed, observed_control = await asyncio.wait_for(asyncio.gather(resume, control), 10)
++        assert 'result' in resumed and 'result' in observed_control, (resumed, observed_control)
++        assert resumed['result']['session_id'] == a, resumed
++        ids = [frame.get('id') for frame in replies.frames]
++        assert ids.index('resume') < ids.index('ordered'), ids
++        # Use the native event publisher and real subscription/stream, not a fabricated frame.
++        target = authority.db.get_compression_tip(a) or a
++        authority.db.set_meta('goal:' + target, GoalState('ORDERING_GOAL', status='paused', created_at=50).to_json())
++        await publish_async(authority, a)
++        await async_wait_until(lambda: any(frame.get('params', {}).get('type') == 'session.control.update'
++                                          for frame in replies.frames), timeout=5, what='native control update on WS')
++        events = [frame['params'] for frame in replies.frames
++                  if frame.get('params', {}).get('type') == 'session.control.update']
++        assert events[-1]['payload']['control']['goal']['title'] == 'ORDERING_GOAL', events
++        record.update(predecessor_before_control=True, native_stream_update=True, conservative_unknown_scope=True)
++    finally:
++        if not pending.done():
++            pending.set_result(None)
++        refresh.refresh_settled = original
++        authority._policy_refreshes.pop(refreshing, None)
++
++
++async def successor_case(authority, replies, a, b, record, mode='successor'):
++    mounted = await replies.call('before-successor', 'session.resume', session_id=a, omit_messages=True)
++    assert 'result' in mounted, mounted
++    revision = mounted['result']['revision']
++    target = a
++    if mode == 'successor-lineage':
++        target = compressed_target(authority, a)
++        revision = authority.db.get_session(target)['runtime_revision']
++    original = authority.db.get_compression_tip
++    entered, release, exited = threading.Event(), threading.Event(), threading.Event()
++
++    def paused(sid, *args, **kwargs):
++        if sid in {a, target} and threading.current_thread() is not threading.main_thread():
++            entered.set()
++            try:
++                assert release.wait(15), 'control storage watchdog expired'
++            finally:
++                exited.set()
++        return original(sid, *args, **kwargs)
++
++    authority.db.get_compression_tip = paused
++    try:
++        control = await replies.send('read-before-write', 'session.control.read', session_id=a)
++        await async_wait_until(entered.is_set, timeout=5, what='actual control projection worker')
++        other = await replies.send('other-control', 'session.control.read', session_id=b)
++        assert 'result' in await asyncio.wait_for(asyncio.shield(other), 5)
++        successor = await replies.send('after-read', 'session.mutate', session_id=target,
++                                       request_id='ordered-rename', expected_revision=revision,
++                                       operation='rename', payload={'title': 'ORDERED_TITLE'})
++        assert (await replies.call('successor-ping', 'gateway.ping'))['result']['ok']
++        await remains_pending(successor)
++        release.set()
++        read_result, exported = await asyncio.wait_for(asyncio.gather(control, successor), 10)
++        assert 'result' in read_result and 'result' in exported, (read_result, exported)
++        ids = [frame.get('id') for frame in replies.frames]
++        assert ids.index('read-before-write') < ids.index('after-read'), ids
++        assert authority.db.get_session(target)['title'] == 'ORDERED_TITLE'
++        record.update(control_before_successor=True, unrelated_control_during_wait=True)
++    finally:
++        release.set()
++        authority.db.get_compression_tip = original
++        if entered.is_set():
++            await async_wait_until(exited.is_set, timeout=5, what='control worker exited')
++        record['paused_worker_exited'] = not entered.is_set() or exited.is_set()
++
++
++async def mutation_lineage_case(authority, replies, a, record):
++    from gateway import session_mutations as mutations
++    child = compressed_target(authority, a)
++    revision = authority.db.get_session(child)['runtime_revision']
++    live = authority.sessions[a]
++    original = mutations._owner_ref
++    entered = asyncio.Event()
++
++    def observed(owner, ref, params):
++        result = original(owner, ref, params)
++        if ref.session_id == child:
++            assert result.session_id == a, result
++            entered.set()
++        return result
++
++    mutations._owner_ref = observed
++    await live.mutation_lock.acquire()
++    try:
++        mutation = await replies.send('segment-rename', 'session.mutate', session_id=child,
++                                      request_id='segment-rename', expected_revision=revision,
++                                      operation='rename', payload={'title': 'LINEAGE_TITLE'})
++        await asyncio.wait_for(entered.wait(), 5)
++        control = await replies.send('root-control', 'session.control.read', session_id=a)
++        assert (await replies.call('lineage-ping', 'gateway.ping'))['result']['ok']
++        await remains_pending(control)
++        live.mutation_lock.release()
++        changed, snapshot = await asyncio.wait_for(asyncio.gather(mutation, control), 10)
++        assert 'result' in changed and 'result' in snapshot, (changed, snapshot)
++        assert authority.db.get_session(child)['title'] == 'LINEAGE_TITLE'
++        ids = [frame.get('id') for frame in replies.frames]
++        assert ids.index('segment-rename') < ids.index('root-control'), ids
++        record.update(physical_mutation_before_logical_control=True)
++    finally:
++        if live.mutation_lock.locked():
++            live.mutation_lock.release()
++        mutations._owner_ref = original
+diff --git a/tests/gateway/fixtures/control_read_ordering_peer.py b/tests/gateway/fixtures/control_read_ordering_peer.py
+new file mode 100644
+index 00000000..7286c6d5
+--- /dev/null
++++ b/tests/gateway/fixtures/control_read_ordering_peer.py
+@@ -0,0 +1,170 @@
++"""Authenticated WS ordering probes; only a storage leaf is paused, no model calls."""
++import asyncio
++import json
++import os
++from pathlib import Path
++import sys
++import threading
++import time
++import traceback
++
++
++class Replies:
++    def __init__(self, ws):
++        self.ws = ws
++        self.frames = []
++        self.waiters = {}
++        self.task = asyncio.create_task(self.read())
++
++    async def read(self):
++        async for raw in self.ws:
++            frame = json.loads(raw)
++            self.frames.append(frame)
++            waiter = self.waiters.get(frame.get('id'))
++            if waiter is not None and not waiter.done():
++                waiter.set_result(frame)
++
++    async def send(self, rid, method, **params):
++        future = asyncio.get_running_loop().create_future()
++        self.waiters[rid] = future
++        await self.ws.send(json.dumps({'jsonrpc': '2.0', 'id': rid, 'method': method, 'params': params}))
++        return future
++
++    async def call(self, rid, method, **params):
++        future = await self.send(rid, method, **params)
++        return await asyncio.wait_for(asyncio.shield(future), 10)
++
++    async def close(self):
++        self.task.cancel()
++        await asyncio.gather(self.task, return_exceptions=True)
++
++
++async def probe(mode):
++    from gateway.run import GatewayRunner
++    from gateway.session_authority import initialize_session_authority
++    from gateway.run_api import start_gateway_api, stop_gateway_api
++    from hermes_cli import web_server
++    from hermes_cli.dashboard_auth.ws_tickets import mint_ticket
++    from tests.waiting import async_wait_until
++    from websockets.asyncio.client import connect
++
++    home = Path(os.environ['HERMES_HOME'])
++    (home / 'config.yaml').write_text('gateway:\n  multiplex_profiles: false\nmodel:\n  provider: custom\n  default: no-inference\n  base_url: http://127.0.0.1:1/v1\nauxiliary:\n  title_generation:\n    enabled: false\n')
++    runner = GatewayRunner()
++    authority = await initialize_session_authority(runner, profile_id=str(home), instance_id='ordering')
++    api = await start_gateway_api(runner)
++    web_server.app.state.auth_required = True
++    from tests.gateway.fixtures.control_read_lifetime_cases import ConnectionWatch
++    watcher = ConnectionWatch()
++
++    def socket():
++        ticket = mint_ticket(user_id='owner', provider='fixture')
++        return connect(api.api_origin.replace('http:', 'ws:') + '/api/ws?ticket=' + ticket)
++
++    entered, release, exited = threading.Event(), threading.Event(), threading.Event()
++    original = authority.db.get_session
++    record = {'mode': mode, 'authenticated_ws': True, 'no_inference': True}
++    try:
++        async with socket() as ws, socket() as other:
++            replies, second = Replies(ws), Replies(other)
++            try:
++                ids = []
++                for index in range(2):
++                    created = await replies.call('create' + str(index), 'session.create',
++                                                 request_id='ordering' + str(index), source='gui', toolsets=[])
++                    assert 'result' in created, created
++                    ids.append(created['result']['session_id'])
++                a, b = ids
++                warm = await replies.call('warm', 'session.control.read', session_id=b)
++                assert 'result' in warm, warm
++
++                from functools import partial
++                from tests.gateway.fixtures.control_read_ordering_cases import (
++                    mutation_lineage_case, resume_case, successor_case,
++                )
++                from tests.gateway.fixtures.control_read_lifetime_cases import (
++                    lifetime_case, permission_case, started_disconnect_case,
++                )
++                cases = {
++                    **{key: partial(resume_case, authority, replies, a, b, record, key) for key in
++                       ('resume', 'resume-short', 'resume-lineage', 'resume-other')},
++                    **{key: partial(successor_case, authority, replies, a, b, record, key) for key in
++                       ('successor', 'successor-lineage')},
++                    **{key: partial(lifetime_case, authority, replies, a, b, record, key, watcher) for key in
++                       ('disconnect', 'cancel-flood')},
++                    'permissions': partial(permission_case, authority, replies, a, record),
++                    'mutation-lineage': partial(mutation_lineage_case, authority, replies, a, record),
++                    'disconnect-started': partial(started_disconnect_case, authority, replies, second, a, record, watcher),
++                }
++                if mode in cases:
++                    await cases[mode]()
++                    return
++
++                def paused(sid, *args, **kwargs):
++                    if sid == a and threading.current_thread() is not threading.main_thread():
++                        entered.set()
++                        try:
++                            assert release.wait(15), 'export leaf watchdog expired'
++                        finally:
++                            exited.set()
++                    return original(sid, *args, **kwargs)
++
++                authority.db.get_session = paused
++                same = mode in {'same-export', 'same-profile-alias'}
++                export_params = {'profile': 'default'} if mode == 'same-profile-alias' else {}
++                control_params = {}  # omitted profile and explicit 'default' are the supported aliases
++                export = await replies.send('export', 'session.export', session_id=a, format='json', **export_params)
++                await async_wait_until(entered.is_set, timeout=5, what='real export storage worker entered')
++                start = time.monotonic()
++                control = await replies.send('control', 'session.control.read', session_id=a if same else b, **control_params)
++                ping = await replies.call('ping', 'gateway.ping')
++                assert ping.get('result') == {'ok': True}, ping
++                independent = await second.call('second', 'session.control.read', session_id=b)
++                assert 'result' in independent, independent
++                try:
++                    answer = await asyncio.wait_for(asyncio.shield(control), 2)
++                except TimeoutError:
++                    answer = None
++                record.update(control_before_release=answer is not None,
++                              control_wait_ms=(time.monotonic() - start) * 1000,
++                              ping_before_release=True, second_socket_before_release=True)
++                if same:
++                    assert answer is None, 'same-session control overtook its export predecessor'
++                    release.set()
++                    answer = await asyncio.wait_for(asyncio.shield(control), 10)
++                    assert 'result' in answer, answer
++                    ids = [frame.get('id') for frame in replies.frames]
++                    assert ids.index('export') < ids.index('control'), ids
++                else:
++                    assert answer is not None, 'control(B) remained behind real export(A) on the same socket'
++                    assert 'result' in answer and answer['result'] == independent['result'], answer
++                    assert not export.done() and not release.is_set()
++            finally:
++                release.set()
++                authority.db.get_session = original
++                if entered.is_set():
++                    await async_wait_until(exited.is_set, timeout=5, what='export worker exited')
++                if 'export' in replies.waiters:
++                    finished = await asyncio.wait_for(asyncio.shield(replies.waiters['export']), 10)
++                    assert 'result' in finished, finished
++                await replies.close()
++                await second.close()
++    finally:
++        await stop_gateway_api(api)
++        watcher.close()
++        record['paused_worker_exited'] = not entered.is_set() or exited.is_set()
++        record['imports'] = {name: str(Path(str(sys.modules[name].__file__)).resolve()) for name in
++                             ('tui_gateway.ws', 'gateway.session_controls', 'gateway.session_ancillary', 'hermes_state')}
++        (home / 'receipt.json').write_text(json.dumps(record, indent=2))
++
++
++if __name__ == '__main__':
++    status = 0
++    try:
++        asyncio.run(probe(sys.argv[1]))
++    except BaseException:
++        traceback.print_exc()
++        status = 1
++    sys.stdout.flush()
++    sys.stderr.flush()
++    os._exit(status)
+diff --git a/tests/gateway/test_control_read_ordering.py b/tests/gateway/test_control_read_ordering.py
+new file mode 100644
+index 00000000..99ed1aff
+--- /dev/null
++++ b/tests/gateway/test_control_read_ordering.py
+@@ -0,0 +1,36 @@
++"""Real authenticated TCP regression for control reads behind foreign-session work."""
++import json
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++from tests.gateway.fixtures.local_recovery_probe import child_env
++
++
++def probe(tmp_path, mode):
++    root = Path(__file__).resolve().parents[2]
++    home, user = tmp_path / 'state', tmp_path / 'user'
++    home.mkdir()
++    user.mkdir()
++    env = child_env()
++    env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home),
++               PYTHONPATH=str(root), PYTHONUNBUFFERED='1', PYTHONDONTWRITEBYTECODE='1',
++               HERMES_DISABLE_LAZY_INSTALLS='1')
++    result = subprocess.run([sys.executable, str(root / 'tests/gateway/fixtures/control_read_ordering_peer.py'), mode],
++                            cwd=root, env=env, capture_output=True, text=True, timeout=90, check=False)
++    receipt = json.loads((home / 'receipt.json').read_text()) if (home / 'receipt.json').exists() else {}
++    print(json.dumps(receipt))
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert receipt['authenticated_ws'] and receipt['paused_worker_exited']
++    return receipt
++
++
++def test_control_read_overtakes_only_an_unrelated_session_export(tmp_path):
++    assert probe(tmp_path, 'export')['control_before_release']
++
++
++@pytest.mark.parametrize('mode', ['same-export', 'same-profile-alias', 'resume', 'resume-short', 'resume-lineage', 'resume-other', 'successor',
++                                 'successor-lineage', 'mutation-lineage', 'disconnect', 'disconnect-started', 'cancel-flood', 'permissions'])
++def test_overlapping_requests_keep_order(tmp_path, mode):
++    probe(tmp_path, mode)
+diff --git a/tests/gateway/test_control_read_unknown_scope.py b/tests/gateway/test_control_read_unknown_scope.py
+new file mode 100644
+index 00000000..2d99d795
+--- /dev/null
++++ b/tests/gateway/test_control_read_unknown_scope.py
+@@ -0,0 +1,43 @@
++"""Unknown socket scope cannot be inferred from an absent session ID (architect counterexample)."""
++import asyncio
++
++import pytest
++
++pytest_plugins = ('tests.gateway.test_sibling_attach_while_profile_starting',)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('method', ['profiles.list', 'not.a.known.method'])
++async def test_unknown_scope_fences_a_secondary_control_read(rig, monkeypatch, method):
++    from tui_gateway import ws as ws_mod
++    from tests.gateway.fixtures.control_read_ordering_cases import remains_pending
++    original = ws_mod._dispatch_request
++    entered, release = asyncio.Event(), asyncio.Event()
++
++    async def observed(connection, request, name, transport):
++        if request.get('id') == 'unknown-scope':
++            entered.set()
++            await release.wait()
++        return await original(connection, request, name, transport)
++
++    monkeypatch.setattr(ws_mod, '_dispatch_request', observed)
++    sock = await rig.connect()
++    rig.create(sock, 'alpha', 'alpha-for-fence')
++    created = await sock.reply('alpha-for-fence')
++    sid = created['result']['session_id']
++    sock.inbound.put_nowait({'jsonrpc': '2.0', 'id': 'unknown-scope', 'method': method, 'params': {}})
++    await asyncio.wait_for(entered.wait(), 5)
++    sock.inbound.put_nowait({'jsonrpc': '2.0', 'id': 'secondary-control', 'method': 'session.control.read',
++                            'params': {'profile': 'alpha', 'session_id': sid}})
++    control = asyncio.create_task(sock.reply('secondary-control'))
++    try:
++        await remains_pending(control)
++    finally:
++        release.set()
++    first, second = await asyncio.gather(sock.reply('unknown-scope'), control)
++    if method == 'profiles.list':
++        assert 'result' in first, first
++    else:
++        assert first['error']['code'] == -32601, first
++    assert 'result' in second, second
++    assert sock.order.index('unknown-scope') < sock.order.index('secondary-control'), sock.order
+diff --git a/tui_gateway/ws.py b/tui_gateway/ws.py
+index 0083b901..5b732dcc 100644
+--- a/tui_gateway/ws.py
++++ b/tui_gateway/ws.py
+@@ -21,6 +21,7 @@ from agent.message_sanitization import _sanitize_surrogates
+ from tui_gateway.event_replay import replay_epoch
+ from tui_gateway.transport import serialize_frame
+ from tui_gateway.ws_legacy_fallback import dispatch_legacy, legacy_fallback_allowed
++from tui_gateway.ws_request_order import OrderedRequest, RequestOrder, request_scope
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -92,7 +93,7 @@ _WS_WRITE_TIMEOUT_S = 10.0
+ # later frame and RPC reply parked behind the writer lock (#106369).
+ _WS_SEND_DEADLINE_S = 30.0
+ _WS_LOG_PAYLOAD_PREVIEW = 240
+-# Frames read ahead of a busy dispatcher. RPCs still dispatch one at a time in arrival order, but on a
++# Frames read ahead of a busy dispatcher. Serial RPCs dispatch in arrival order, but on a
+ # per-connection task so the read loop keeps answering gateway.ping while a handler blocks (a lock held
+ # by a long compaction, a GIL-heavy turn): the client's heartbeat deadline measures the transport, not
+ # handler latency (#108325). A full queue parks the reader — the old serial behaviour.
+@@ -444,6 +445,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol:
+     concurrent_read_slots = asyncio.Semaphore(_WS_CONCURRENT_READ_LIMIT)
+     # Running + waiting reads: taken by the reader before a read is queued, so a flood parks it.
+     read_admission = asyncio.Semaphore(_WS_CONCURRENT_READ_LIMIT + _WS_WAITING_READ_LIMIT)
++    order = RequestOrder()
+     # Set when the read lane could not send a reply: ends the reader without cancelling the
+     # control handler the serial lane is running (it finishes, then the dispatcher stops).
+     send_failed: asyncio.Future = asyncio.get_running_loop().create_future()
+@@ -466,9 +468,21 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol:
+         already dispatches keeps going (a viewer leaving never stops a turn)."""
+         client_gone.set()
+         held_dropped.update(key for key, started in held_waiting.items() if not started.is_set())
++        # A queued serial successor may await an early read's completion fence.
++        # Drop unstarted reads BEFORE draining that queue, not after it.
++        for read in concurrent_reads:
++            if read not in started_reads:
++                read.cancel()
+ 
+     async def _dispatch_one(req: Any) -> None:
+         """Dispatch one request and write its inline reply."""
++        if isinstance(req, OrderedRequest):
++            try:
++                await req.ready()
++                await _dispatch_one(req.request)
++            finally:
++                req.finish()
++            return
+         nonlocal dispatch_crashes
+         req_id = req.get("id") if isinstance(req, dict) else None
+         req_method = req.get("method") if isinstance(req, dict) else None
+@@ -489,6 +503,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol:
+                          "ws response send failed peer=%s id=%s method=%s", peer, req_id, req_method)
+ 
+     async def _dispatch_concurrent_read(req: Any) -> None:
++        if isinstance(req, OrderedRequest):
++            await req.ready()  # waiting for same-session work consumes admission, not a run slot
+         async with concurrent_read_slots:
+             started_reads.add(asyncio.current_task())
+             try:
+@@ -508,6 +524,14 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol:
+         with contextlib.suppress(asyncio.CancelledError, _SendFailed):
+             task.result()
+ 
++    def _start_read(req: Any) -> None:
++        task = asyncio.create_task(_dispatch_concurrent_read(req))
++        concurrent_reads.add(task)
++        if isinstance(req, OrderedRequest):
++            # Includes cancellation before the task's first step.
++            task.add_done_callback(lambda _: req.finish())
++        task.add_done_callback(_finish_concurrent_read)
++
+     async def _dispatch_after_start(key: str, started: asyncio.Event) -> None:
+         """Dispatch the frames held for one start, in arrival order, once it ends or the wait runs out
+         (the authority then refuses a profile still starting retryably). A frame for that profile read
+@@ -523,7 +547,9 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol:
+             del held_waiting[key]  # dispatching from here on: a later disconnect lets these frames finish
+             frames = held[key]
+             if key in held_dropped:
+-                for _ in frames:
++                for frame in frames:
++                    if isinstance(frame, OrderedRequest):
++                        frame.finish()
+                     held_room.release()
+                 frames.clear()
+             while frames:
+@@ -536,15 +562,20 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol:
+         finally:
+             held_waiting.pop(key, None)  # cancelled while waiting (server shutdown)
+             held_dropped.discard(key)
++            for frame in held[key]:
++                if isinstance(frame, OrderedRequest):
++                    frame.finish()
++                held_room.release()
+             del held[key]
+ 
+     async def _hold_for_profile_start(req: Any) -> bool:
+-        if authority_connection is None or authority_connection.awaits_profile_start(req, held) is None:
++        request = req.request if isinstance(req, OrderedRequest) else req
++        if authority_connection is None or authority_connection.awaits_profile_start(request, held) is None:
+             return False
+         await _unless_dispatch_failed(held_room.acquire())
+         # Asked again after waiting for room: the start may have ended and its lane drained meanwhile,
+         # and then the frame goes to the serial lane behind the frames that lane already answered.
+-        start = authority_connection.awaits_profile_start(req, held)
++        start = authority_connection.awaits_profile_start(request, held)
+         if start is None:
+             held_room.release()
+             return False
+@@ -583,11 +614,10 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol:
+     async def _dispatch_loop() -> None:
+         """Dispatch controls in arrival order; bounded expensive read-only projections run alongside them."""
+         while (req := await _next_request()) is not stop:
+-            req_method = req.get("method") if isinstance(req, dict) else None
++            request = req.request if isinstance(req, OrderedRequest) else req
++            req_method = request.get("method") if isinstance(request, dict) else None
+             if req_method in _WS_CONCURRENT_READ_METHODS:
+-                task = asyncio.create_task(_dispatch_concurrent_read(req))
+-                concurrent_reads.add(task)
+-                task.add_done_callback(_finish_concurrent_read)
++                _start_read(req)
+                 continue
+             if await _hold_for_profile_start(req):
+                 continue
+@@ -597,10 +627,20 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol:
+         if _answers_open_request(req):
+             await _dispatch_one(req)
+             return
+-        if isinstance(req, dict) and req.get("method") in _WS_CONCURRENT_READ_METHODS:
++        method = req.get('method') if isinstance(req, dict) else None
++        early = (authority_connection is not None and method == 'session.control.read'
++                 and authority_connection.awaits_profile_start(req, held) is None)
++        if early or method in _WS_CONCURRENT_READ_METHODS:
+             # A read past the waiting cap parks the reader, as the serial lane did; released
+             # when its task ends (a read cancelled before it ran releases it too).
+             await _unless_dispatch_failed(read_admission.acquire())
++        # Leave the established context-read and legacy semantics alone. Only canonical
++        # control reads can bypass serial work, with explicit predecessor/successor fences.
++        if authority_connection is not None and method not in _WS_CONCURRENT_READ_METHODS:
++            req = order.admit(req, request_scope(authority_connection, req), early=early)
++        if early:
++            _start_read(req)
++            return
+         await _unless_dispatch_failed(pending.put(req))
+ 
+     async def _end_reads() -> None:
+diff --git a/tui_gateway/ws_request_order.py b/tui_gateway/ws_request_order.py
+new file mode 100644
+index 00000000..3b6095db
+--- /dev/null
++++ b/tui_gateway/ws_request_order.py
+@@ -0,0 +1,91 @@
++"""Socket-local completion fences for early control projections, not an execution queue."""
++from __future__ import annotations
++
++import asyncio
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++# These handlers act on the exact ref they authorize. Resume/activate can resolve a
++# title, short ID or physical lineage segment: keep those (and unknown verbs) fenced.
++_EXACT_SESSION_METHODS = frozenset({
++    'session.control.read', 'session.export', 'session.info',
++    'session.detach', 'session.interrupt', 'session.events.since',
++    'process.list', 'subagent.list', 'subagent.tail', 'approval.pending',
++})
++_PROFILE_FENCED_METHODS = frozenset({'session.resume', 'session.mutate', 'session.create', 'session.list'})
++
++
++def request_scope(connection: Any, request: Any) -> tuple[str, str | None] | None:
++    """Only split a proven exact-session request; routing/authorization still run at dispatch."""
++    if connection is None or not isinstance(request, dict):
++        return None
++    params = request.get('params')
++    if not isinstance(params, dict):
++        return None
++    sid = params.get('session_id')
++    method = request.get('method')
++    if method in _PROFILE_FENCED_METHODS:
++        sid = None
++    elif method not in _EXACT_SESSION_METHODS or not isinstance(sid, str) or not sid:
++        return None  # unknown/sessionless verbs may mutate process-wide state
++    authority = connection.authority
++    profile = params.get('profile')
++    if profile:
++        if not isinstance(profile, str):
++            return None
++        from hermes_cli.profiles import profile_matches_home
++        if not profile_matches_home(profile, Path(authority.profile_id)):
++            if not connection.host_scoped:
++                return None
++            registry = getattr(authority.runner, 'session_authorities', ())
++            authority = next((item for item in registry
++                              if profile_matches_home(profile, Path(item.profile_id))), None)
++            if authority is None:
++                starting = registry.starting(profile) if registry else None
++                return (starting[0], None) if starting is not None else None
++    if sid is not None:
++        live = authority.sessions.get(sid)
++        from gateway.config import Platform
++        source = getattr(live, 'source', None)
++        # The mounted LOCAL owner is already canonical in memory. Cold IDs, history
++        # segments and messaging routes require owner resolution; do not read SQLite
++        # on the receive loop just to speculate that they are independent.
++        if source is None or source.platform != Platform.LOCAL or source.chat_id != sid:
++            sid = None
++    return (authority.profile_id, sid)
++
++
++def overlaps(left, right) -> bool:
++    return (left is None or right is None or
++            (left[0] == right[0] and (left[1] is None or right[1] is None or left[1] == right[1])))
++
++
++@dataclass(eq=False)
++class OrderedRequest:
++    request: Any
++    dependencies: tuple[asyncio.Future, ...]
++    finished: asyncio.Future
++
++    async def ready(self) -> None:
++        if self.dependencies:
++            # Cancelling a waiter must not cancel its predecessor's shared completion.
++            await asyncio.wait(self.dependencies)
++
++    def finish(self) -> None:
++        if not self.finished.done():
++            self.finished.set_result(None)
++
++
++class RequestOrder:
++    """Track only admitted in-flight frames; their existing lanes own execution and bounds."""
++    def __init__(self):
++        self.pending = {}
++
++    def admit(self, request, scope, *, early=False):
++        dependencies = tuple(done for done, (other, was_early) in self.pending.items()
++                             if (early or was_early) and overlaps(scope, other))
++        done = asyncio.get_running_loop().create_future()
++        self.pending[done] = (scope, early)
++        done.add_done_callback(self.pending.pop)
++        return OrderedRequest(request, dependencies, done)

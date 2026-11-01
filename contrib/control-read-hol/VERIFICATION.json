@@ -1,0 +1,83 @@
+{
+  "purpose": "Optional guarded main-based supplement to existing PR144701, not a competing implementation PR",
+  "original_effort_author": "AbdullahPesteli",
+  "original_pr": 144701,
+  "original_pr_head": "121ce0a87f7fe3dd2cc93aa258035d26fbd7e722",
+  "base_commit": "016b76da3a8a88e28775e08b6ca2846f471b8eda",
+  "base_official_tree": "ff68247d5204fa6edbd8839b055c541e9906d09a",
+  "tested_source_commit": null,
+  "tested_source_tree": "090f3294606b56e3f9aed13184879d7c05ba083f",
+  "tested_tree_kind": "local archive-initialized snapshot, not a promised public-base resulting whole tree",
+  "patch": {
+    "file": "control-read-hol.patch",
+    "sha256": "48b23960b8677be083758ae36b307d2bf3a6d3e29652eab033dad76d7116324f",
+    "bytes": 41362,
+    "changed_leaves": 7,
+    "production_leaves": 2,
+    "files": {
+      "tests/gateway/fixtures/control_read_lifetime_cases.py": {
+        "after": "475dc7ca245d11e3f0c74bca418e64430d28c8dd2e403bcb481d77995363f41d",
+        "before": null
+      },
+      "tests/gateway/fixtures/control_read_ordering_cases.py": {
+        "after": "c58b8d944552629c792e630d55b4fdf58397c9fdcf16f0bf47750dc16edcca50",
+        "before": null
+      },
+      "tests/gateway/fixtures/control_read_ordering_peer.py": {
+        "after": "97c6088927593e8664690ec0fb09591eb6cb014c83e6721135bb33a7fffbd2b1",
+        "before": null
+      },
+      "tests/gateway/test_control_read_ordering.py": {
+        "after": "a9044899affbd4b589d369b20f49db85988f1bc503654b0461c6292ee619c40d",
+        "before": null
+      },
+      "tests/gateway/test_control_read_unknown_scope.py": {
+        "after": "77b9fa2b5a8e200b0205291f66a65e44f0bdd4bf1712d0525d15e4656d6a6fed",
+        "before": null
+      },
+      "tui_gateway/ws.py": {
+        "after": "b63213c43f45a4479c2cea09ba4784f940203a24e5af00a8a3f31465602cb752",
+        "before": "8972de9838a05ddee1a4d8276e238acf829330bf400869ed8e8bcbd5a4389b35"
+      },
+      "tui_gateway/ws_request_order.py": {
+        "after": "2afc13c48965eecc1ce9a8d0852bece81440d5037a2b5ea3b0de0d48c5f5a82a",
+        "before": null
+      }
+    }
+  },
+  "optional_QA_source": {
+    "file": "test_qa_hol_edges.py",
+    "sha256": "2ca7424035dd5ce8018cdca17352836dc7a09cfc256a9d54a847cd5a268ccdbf",
+    "bytes": 8443,
+    "target": "tests/gateway/test_qa_hol_edges.py",
+    "included_in_primary_patch": false
+  },
+  "independent_QA": {
+    "original_unique": 46,
+    "extra_unique": 4,
+    "final_unique": 50,
+    "not_one_single_run": true,
+    "failures": 0,
+    "errors": 0,
+    "skips": 0,
+    "source_identity_entries_checked_by_QA": 21923,
+    "official_dependency_blobs": 12,
+    "static_selection": [
+      "ruff",
+      "health"
+    ],
+    "static_checks": 2,
+    "health_blocking": 0,
+    "health_advisory": 0,
+    "full_CI_claim": false
+  },
+  "independently_inspected_later_head": "9a76ac8e4f612c081e12008923893077f10f2ec7",
+  "unverified": [
+    "natural production latency",
+    "all heartbeat outages",
+    "Dashboard HTTP or right pane",
+    "installed Windows Electron",
+    "upstream acceptance",
+    "runtime adoption"
+  ]
+}
