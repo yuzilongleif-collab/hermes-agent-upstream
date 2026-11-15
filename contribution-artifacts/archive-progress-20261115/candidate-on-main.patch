@@ -1,0 +1,695 @@
+diff --git a/apps/desktop/src/app/settings/archive-integration.test.tsx b/apps/desktop/src/app/settings/archive-integration.test.tsx
+new file mode 100644
+index 00000000..30dcf20b
+--- /dev/null
++++ b/apps/desktop/src/app/settings/archive-integration.test.tsx
+@@ -0,0 +1,236 @@
++// @vitest-environment jsdom
++import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { $apiRequestScope } from '@/api/client'
++import type { HermesApiRequest } from '@/global'
++import { deleteSession, setSessionArchived } from '@/hermes'
++import { en } from '@/i18n/en'
++import { notifyError } from '@/store/notifications'
++import { listEveryArchivedSession } from '@/store/sidebar-archive'
++import type { SessionInfo } from '@/types/hermes'
++
++import { SessionsSettings } from './sessions-settings'
++
++vi.mock('@/i18n', () => ({ useI18n: () => ({ t: en }) }))
++vi.mock('@/hermes', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  getHermesConfigRecord: vi.fn().mockResolvedValue({}),
++  deleteSession: vi.fn().mockResolvedValue({ ok: true }),
++  setSessionArchived: vi.fn().mockResolvedValue({ ok: true })
++}))
++vi.mock('@/store/confirm', () => ({ confirm: vi.fn().mockResolvedValue(true) }))
++vi.mock('@/store/notifications', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  notifyError: vi.fn()
++}))
++
++const deferred = <T,>() => {
++  let resolve!: (value: T) => void
++  let reject!: (reason: unknown) => void
++
++  const promise = new Promise<T>((yes, no) => {
++    resolve = yes
++    reject = no
++  })
++
++  return { promise, resolve, reject }
++}
++
++const row = (id: string, profile = 'default', connection_id?: string): SessionInfo =>
++  ({
++    id,
++    profile,
++    connection_id,
++    archived: true,
++    source: 'desktop',
++    title: `${id}-${profile}-${connection_id ?? 'local'}`,
++    started_at: 1,
++    last_active: 1,
++    message_count: 1,
++    input_tokens: 0,
++    output_tokens: 0,
++    tool_call_count: 0,
++    ended_at: null,
++    model: null,
++    preview: null,
++    is_active: false
++  }) as SessionInfo
++
++const page = (offset: number, count = 500) => Array.from({ length: count }, (_, i) => row(`archive-${offset + i}`))
++const api = vi.fn<(request: HermesApiRequest) => Promise<unknown>>()
++
++const offsets = () =>
++  api.mock.calls.map(([request]) => Number(new URL(request.path, 'http://fixture').searchParams.get('offset')))
++
++const listRows = () => window.document.querySelectorAll('[id^="archived-session-"]')
++
++beforeEach(() => {
++  $apiRequestScope.set({ connectionId: null, profile: null })
++  api.mockReset()
++  vi.mocked(notifyError).mockClear()
++  vi.mocked(deleteSession).mockClear()
++  vi.mocked(setSessionArchived).mockClear()
++  Object.assign(window, { hermesDesktop: { api } })
++})
++afterEach(() => {
++  cleanup()
++  Reflect.deleteProperty(window, 'hermesDesktop')
++})
++
++describe('real Settings → archive loader → list API → synthetic bridge', () => {
++  it('retains five full pages during sixth-page failure and Retry reads from zero to the exact 3000-row set', async () => {
++    const tail = deferred<unknown>()
++    const timeout = new Error('Timed out connecting to Hermes backend after 60000ms')
++    const pin = { ...row('live-pin'), archived: false, pinned: true }
++    let retry = false
++    api.mockImplementation(async request => {
++      const offset = Number(new URL(request.path, 'http://fixture').searchParams.get('offset'))
++
++      return !retry && offset === 2500 ? tail.promise : { sessions: [...page(offset), pin], total: 3000 }
++    })
++    render(<SessionsSettings subpage="archived" />)
++    await waitFor(() => expect(api).toHaveBeenCalledTimes(6))
++    expect(listRows()).toHaveLength(2500)
++    expect(window.document.querySelector('[role="status"]')?.textContent).toBe(en.settings.sessions.loading)
++    expect(offsets()).toEqual([0, 500, 1000, 1500, 2000, 2500])
++    await act(async () => tail.reject(timeout))
++    expect(listRows()).toHaveLength(2500)
++    const alert = window.document.querySelector('[role="alert"]') as HTMLElement
++    expect(alert.textContent).toContain(en.settings.sessions.failedLoad)
++    expect(notifyError).toHaveBeenCalledExactlyOnceWith(timeout, en.settings.sessions.failedLoad)
++    expect(window.document.body.textContent).not.toContain(en.settings.sessions.emptyArchivedTitle)
++    retry = true
++    await act(async () => fireEvent.click(within(alert).getByRole('button', { name: en.common.retry })))
++    await waitFor(() => expect(listRows()).toHaveLength(3000))
++    expect(offsets()).toEqual([0, 500, 1000, 1500, 2000, 2500, 0, 500, 1000, 1500, 2000, 2500])
++    expect(new Set([...listRows()].map(node => node.id))).toEqual(
++      new Set(Array.from({ length: 3000 }, (_, i) => `archived-session-archive-${i}`))
++    )
++    expect(window.document.querySelector('[role="alert"]')).toBeNull()
++    expect(window.document.querySelector('[role="status"]')).toBeNull()
++  }, 90_000)
++
++  it.each([
++    ['restore', 'profile'],
++    ['delete', 'profile'],
++    ['restore', 'connection'],
++    ['delete', 'connection']
++  ] as const)('does not resurrect a row after %s while keeping a same-ID sibling %s', async (action, owner) => {
++    const tail = deferred<unknown>()
++
++    const rows =
++      owner === 'profile'
++        ? [row('same', 'default'), row('same', 'work')]
++        : [row('same', 'default', 'a'), row('same', 'default', 'b')]
++
++    const targetTitle = rows[0].title as string
++    const siblingTitle = rows[1].title as string
++    api.mockResolvedValueOnce({ sessions: rows, total: 3 }).mockReturnValueOnce(tail.promise)
++    render(<SessionsSettings subpage="archived" />)
++    await waitFor(() => expect(listRows()).toHaveLength(2))
++    const target = screen.getByText(targetTitle).closest('[id^="archived-session-"]') as HTMLElement
++    const name = action === 'restore' ? en.settings.sessions.unarchive : en.settings.sessions.deletePermanently
++    await act(async () => fireEvent.click(within(target).getByRole('button', { name })))
++    expect(screen.queryByText(targetTitle)).toBeNull()
++    expect(screen.getByText(siblingTitle)).toBeDefined()
++    expect(action === 'restore' ? setSessionArchived : deleteSession).toHaveBeenCalledWith(
++      ...(action === 'restore' ? ['same', false, 'default'] : ['same', 'default'])
++    )
++    await act(async () => tail.resolve({ sessions: [...rows, row('last')], total: 3 }))
++    expect(screen.queryByText(targetTitle)).toBeNull()
++    expect(screen.getByText(siblingTitle)).toBeDefined()
++    expect(screen.getByText('last-default-local')).toBeDefined()
++    expect(listRows()).toHaveLength(2)
++  })
++
++  it.each(['profile', 'connectionId'] as const)(
++    'fences a late old %s page without issuing an old chain tail',
++    async field => {
++      const old = deferred<unknown>()
++      api.mockReturnValueOnce(old.promise).mockResolvedValue({ sessions: [row('new-owner')], total: 1 })
++      render(<SessionsSettings subpage="archived" />)
++      await waitFor(() => expect(api).toHaveBeenCalledTimes(1))
++      await act(async () => $apiRequestScope.setKey(field, 'other'))
++      await screen.findByText('new-owner-default-local')
++      await act(async () => old.resolve({ sessions: page(0), total: 3000 }))
++      expect(api).toHaveBeenCalledTimes(2)
++      expect(listRows()).toHaveLength(1)
++      expect(screen.queryByText('archive-0-default-local')).toBeNull()
++      expect(notifyError).not.toHaveBeenCalled()
++    }
++  )
++
++  it.each(['resolve', 'reject'] as const)(
++    'unmount fences a late %s without a tail request or notification',
++    async result => {
++      const old = deferred<unknown>()
++      api.mockReturnValue(old.promise)
++      const view = render(<SessionsSettings subpage="archived" />)
++      await waitFor(() => expect(api).toHaveBeenCalledTimes(1))
++      view.unmount()
++      await act(async () => {
++        if (result === 'resolve') {
++          old.resolve({ sessions: page(0), total: 3000 })
++        } else {
++          old.reject(new Error('late timeout'))
++        }
++      })
++      expect(api).toHaveBeenCalledTimes(1)
++      expect(notifyError).not.toHaveBeenCalled()
++      expect(listRows()).toHaveLength(0)
++    }
++  )
++
++  it('retains successful profile siblings with visible incomplete state, and distinguishes genuine empty', async () => {
++    api.mockResolvedValueOnce({
++      sessions: [row('partial')],
++      total: 1,
++      errors: [{ profile: 'work', error: 'profile read failed' }]
++    })
++    const view = render(<SessionsSettings subpage="archived" />)
++    await screen.findByRole('alert')
++    expect(screen.getByText('partial-default-local')).toBeDefined()
++    expect(screen.queryByText(en.settings.sessions.emptyArchivedTitle)).toBeNull()
++    view.unmount()
++    api.mockResolvedValue({ sessions: [], total: 0 })
++    render(<SessionsSettings subpage="archived" />)
++    await screen.findByText(en.settings.sessions.emptyArchivedTitle)
++    expect(screen.queryByRole('alert')).toBeNull()
++  })
++
++  it('deduplicates by connection, profile and ID; snapshots do not grow after later pages', async () => {
++    const a = row('same', 'default', 'a')
++    const b = row('same', 'work', 'a')
++    const c = row('same', 'default', 'b')
++    api
++      .mockResolvedValueOnce({ sessions: [a, b, c], total: 4 })
++      .mockResolvedValueOnce({ sessions: [a, b, c, row('last')], total: 4 })
++    const snapshots: SessionInfo[][] = []
++    const result = await listEveryArchivedSession({ onPage: rows => snapshots.push(rows) })
++    expect(result).toHaveLength(4)
++    expect(snapshots.map(rows => rows.length)).toEqual([3, 4])
++    expect(snapshots[0]).not.toBe(snapshots[1])
++    expect(offsets()).toEqual([0, 500])
++  })
++
++  it('does not claim to cancel the in-flight bridge: cancellation settles only after its reply', async () => {
++    const old = deferred<unknown>()
++    api.mockReturnValue(old.promise)
++    const controller = new AbortController()
++    let settled = false
++
++    const done = listEveryArchivedSession({ signal: controller.signal }).finally(() => {
++      settled = true
++    })
++
++    const aborted = expect(done).rejects.toMatchObject({ name: 'AbortError' })
++    controller.abort()
++    await Promise.resolve()
++    expect(settled).toBe(false)
++    expect(api.mock.calls[0][0]).not.toHaveProperty('signal')
++    old.resolve({ sessions: page(0), total: 3000 })
++    await aborted
++    expect(api).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/apps/desktop/src/app/settings/archived-progress.test.tsx b/apps/desktop/src/app/settings/archived-progress.test.tsx
+new file mode 100644
+index 00000000..a22ea29b
+--- /dev/null
++++ b/apps/desktop/src/app/settings/archived-progress.test.tsx
+@@ -0,0 +1,135 @@
++// @vitest-environment jsdom
++import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { $apiRequestScope } from '@/api/client'
++import { en } from '@/i18n/en'
++import type { SessionInfo } from '@/types/hermes'
++
++import { SessionsSettings } from './sessions-settings'
++
++const listEveryArchivedSession = vi.hoisted(() => vi.fn())
++const notifyError = vi.hoisted(() => vi.fn())
++
++vi.mock('@/i18n', () => ({ useI18n: () => ({ t: en }) }))
++vi.mock('@/store/sidebar-archive', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  listEveryArchivedSession
++}))
++vi.mock('@/store/notifications', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  notifyError
++}))
++
++const row = (id: string, profile = 'default'): SessionInfo =>
++  ({
++    archived: true,
++    ended_at: null,
++    id,
++    input_tokens: 0,
++    is_active: false,
++    last_active: 1,
++    message_count: 1,
++    model: null,
++    output_tokens: 0,
++    preview: null,
++    profile,
++    source: 'desktop',
++    started_at: 1,
++    title: `${id}-${profile}`,
++    tool_call_count: 0
++  }) as SessionInfo
++
++beforeEach(() => {
++  $apiRequestScope.set({ connectionId: null, profile: null })
++  listEveryArchivedSession.mockReset()
++  notifyError.mockReset()
++})
++
++afterEach(() => cleanup())
++
++describe('archived Settings incremental loading', () => {
++  it('keeps an actionable completed row after a later timeout, then retries without an empty success', async () => {
++    let publish!: (rows: SessionInfo[]) => void
++    let rejectTail!: (reason?: unknown) => void
++    const timeout = new Error('Timed out connecting to Hermes backend after 60000ms')
++
++    listEveryArchivedSession.mockImplementationOnce((options: { onPage: typeof publish }) => {
++      publish = options.onPage
++
++      return new Promise<SessionInfo[]>((_, reject) => {
++        rejectTail = reject
++      })
++    })
++    listEveryArchivedSession.mockImplementationOnce(async (options: { onPage: typeof publish }) => {
++      const rows = [row('first'), row('second')]
++      options.onPage(rows)
++
++      return rows
++    })
++
++    render(<SessionsSettings subpage="archived" />)
++    await waitFor(() => expect(listEveryArchivedSession).toHaveBeenCalledTimes(1))
++
++    await act(async () => publish([row('first')]))
++    expect(screen.getByText('first-default')).toBeDefined()
++    expect(screen.getByText(en.settings.sessions.loading)).toBeDefined()
++    expect(screen.getByRole('button', { name: en.settings.sessions.unarchive })).toBeDefined()
++    expect(screen.queryByText(en.settings.sessions.emptyArchivedTitle)).toBeNull()
++
++    await act(async () => rejectTail(timeout))
++    expect(screen.getByRole('alert').textContent).toContain(en.settings.sessions.failedLoad)
++    expect(notifyError).toHaveBeenCalledWith(timeout, en.settings.sessions.failedLoad)
++    expect(screen.getByText('first-default')).toBeDefined()
++    expect(screen.queryByText(en.settings.sessions.emptyArchivedTitle)).toBeNull()
++
++    await act(async () => fireEvent.click(screen.getByRole('button', { name: en.common.retry })))
++    await waitFor(() => expect(screen.getByText('second-default')).toBeDefined())
++    expect(listEveryArchivedSession).toHaveBeenCalledTimes(2)
++    expect(screen.queryByRole('alert')).toBeNull()
++  })
++
++  it('shows Retry, not a successful empty archive, if the first page fails', async () => {
++    listEveryArchivedSession.mockRejectedValue(new Error('offline'))
++
++    render(<SessionsSettings subpage="archived" />)
++    await screen.findByRole('alert')
++
++    expect(screen.getByRole('button', { name: en.common.retry })).toBeDefined()
++    expect(screen.queryByText(en.settings.sessions.emptyArchivedTitle)).toBeNull()
++  })
++
++  it('aborts a previous backend scope and cannot paint its late pages into the next scope', async () => {
++    let publishOld!: (rows: SessionInfo[]) => void
++    let finishOld!: (rows: SessionInfo[]) => void
++
++    listEveryArchivedSession.mockImplementationOnce((options: { onPage: typeof publishOld }) => {
++      publishOld = options.onPage
++
++      return new Promise<SessionInfo[]>(resolve => {
++        finishOld = resolve
++      })
++    })
++    listEveryArchivedSession.mockImplementationOnce(async (options: { onPage: (rows: SessionInfo[]) => void }) => {
++      const rows = [row('new-scope')]
++      options.onPage(rows)
++
++      return rows
++    })
++
++    render(<SessionsSettings subpage="archived" />)
++    await waitFor(() => expect(listEveryArchivedSession).toHaveBeenCalledTimes(1))
++    const oldSignal = listEveryArchivedSession.mock.calls[0][0].signal as AbortSignal
++
++    await act(async () => $apiRequestScope.setKey('connectionId', 'new-connection'))
++    await waitFor(() => expect(screen.getByText('new-scope-default')).toBeDefined())
++    expect(oldSignal.aborted).toBe(true)
++
++    await act(async () => {
++      publishOld([row('stale')])
++      finishOld([row('stale')])
++    })
++    expect(screen.queryByText('stale-default')).toBeNull()
++    expect(screen.getByText('new-scope-default')).toBeDefined()
++  })
++})
+diff --git a/apps/desktop/src/app/settings/sessions-settings.tsx b/apps/desktop/src/app/settings/sessions-settings.tsx
+index b302129e..0b769bf7 100644
+--- a/apps/desktop/src/app/settings/sessions-settings.tsx
++++ b/apps/desktop/src/app/settings/sessions-settings.tsx
+@@ -1,6 +1,8 @@
++import { backendScopeKey } from '@hermes/shared'
+ import { useStore } from '@nanostores/react'
+-import { useCallback, useEffect, useState } from 'react'
++import { useCallback, useEffect, useRef, useState } from 'react'
+ 
++import { $apiRequestScope } from '@/api/client'
+ import { restoreListedSession } from '@/app/session/hooks/use-session-actions/utils'
+ import { Button } from '@/components/ui/button'
+ import { Input } from '@/components/ui/input'
+@@ -46,11 +48,15 @@ function newSessionShortcut(): null | string {
+ 
+ const DEFAULT_AUTO_ARCHIVE_DAYS = 3
+ 
++const archivedRowKey = (session: SessionInfo) =>
++  `${session.connection_id || ''}\0${session.profile || 'default'}\0${session.id}`
++
+ interface SessionsSettingsProps {
+   subpage?: string
+ }
+ 
+ export function SessionsSettings({ subpage }: SessionsSettingsProps = {}) {
++  const scope = useStore($apiRequestScope)
+   useSettingDeepLink('sessions', page => subpage === undefined || page === subpage)
+ 
+   if (subpage === 'default-directory') {
+@@ -61,7 +67,12 @@ export function SessionsSettings({ subpage }: SessionsSettingsProps = {}) {
+     )
+   }
+ 
+-  return <ArchivedSessionsSettings includeDefaultDirectory={subpage === undefined} />
++  return (
++    <ArchivedSessionsSettings
++      includeDefaultDirectory={subpage === undefined}
++      key={backendScopeKey(scope.connectionId, scope.profile)}
++    />
++  )
+ }
+ 
+ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultDirectory: boolean }) {
+@@ -70,21 +81,60 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+   const [sessions, setLocalSessions] = useState<SessionInfo[]>([])
+   const [loading, setLoading] = useState(true)
+   const [busyId, setBusyId] = useState<string | null>(null)
++  const [loadError, setLoadError] = useState(false)
++  const request = useRef<AbortController | null>(null)
++  const removedRows = useRef(new Set<string>())
+ 
+   const load = useCallback(async () => {
++    request.current?.abort()
++    const controller = new AbortController()
++    request.current = controller
+     setLoading(true)
++    setLoadError(false)
+ 
+     try {
+-      setLocalSessions(await listEveryArchivedSession())
++      const result = await listEveryArchivedSession({
++        signal: controller.signal,
++        onPage: rows => {
++          if (!controller.signal.aborted) {
++            setLocalSessions(rows.filter(row => row.archived && !removedRows.current.has(archivedRowKey(row))))
++          }
++        }
++      })
++
++      if (!controller.signal.aborted) {
++        setLocalSessions(result.filter(row => row.archived && !removedRows.current.has(archivedRowKey(row))))
++      }
+     } catch (err) {
+-      notifyError(err, s.failedLoad)
++      if (!controller.signal.aborted) {
++        setLoadError(true)
++        notifyError(err, s.failedLoad)
++      }
+     } finally {
+-      setLoading(false)
++      if (!controller.signal.aborted) {
++        setLoading(false)
++      }
+     }
+   }, [s.failedLoad])
+ 
+   useEffect(() => {
++    const scope = $apiRequestScope.get()
++    const originalScope = backendScopeKey(scope.connectionId, scope.profile)
++
++    // The API request itself is not cancellable on this main revision. Stop
++    // publication and the next page synchronously when its source switches.
++    const off = $apiRequestScope.listen(next => {
++      if (backendScopeKey(next.connectionId, next.profile) !== originalScope) {
++        request.current?.abort()
++      }
++    })
++
+     void load()
++
++    return () => {
++      off()
++      request.current?.abort()
++    }
+   }, [load])
+ 
+   const unarchive = useCallback(
+@@ -93,7 +143,8 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+ 
+       try {
+         await setSessionArchived(session.id, false, session.profile)
+-        setLocalSessions(prev => prev.filter(s => s.id !== session.id))
++        removedRows.current.add(archivedRowKey(session))
++        setLocalSessions(prev => prev.filter(row => archivedRowKey(row) !== archivedRowKey(session)))
+         // Surface it again in the sidebar without waiting for a full refresh, and
+         // lift any optimistic eviction so the grouped tree shows it again too.
+         untombstoneSessions([session.id, session._lineage_root_id])
+@@ -134,7 +185,8 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+         // stored tip and the durable lineage root — the journal keys on the
+         // stored id and the row may carry either.
+         purgeInFlightTurnJournals([session.id, session._lineage_root_id])
+-        setLocalSessions(prev => prev.filter(s => s.id !== session.id))
++        removedRows.current.add(archivedRowKey(session))
++        setLocalSessions(prev => prev.filter(row => archivedRowKey(row) !== archivedRowKey(session)))
+         triggerHaptic('warning')
+       } catch (err) {
+         notifyError(err, s.deleteFailed)
+@@ -148,10 +200,10 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+   useDeepLinkHighlight({
+     elementId: id => `archived-session-${id}`,
+     param: 'session',
+-    ready: id => !loading && sessions.some(session => session.id === id)
++    ready: id => sessions.some(session => session.id === id)
+   })
+ 
+-  if (loading) {
++  if (loading && sessions.length === 0 && !loadError) {
+     return <SettingsSkeleton sections={[{ rows: 1 }, { heading: true, rows: 4 }]} />
+   }
+ 
+@@ -170,7 +222,21 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+         {s.archivedIntro}
+       </p>
+ 
+-      {sessions.length === 0 ? (
++      {loading && (
++        <p className="mb-2 text-(--ui-text-secondary)" role="status">
++          {s.loading}
++        </p>
++      )}
++      {loadError && (
++        <div className="mb-3 flex items-center gap-3" role="alert">
++          <span>{s.failedLoad}</span>
++          <Button onClick={() => void load()} size="sm" type="button" variant="textStrong">
++            {t.common.retry}
++          </Button>
++        </div>
++      )}
++
++      {sessions.length === 0 && !loading && !loadError ? (
+         <EmptyState description={s.emptyArchivedDesc} title={s.emptyArchivedTitle} />
+       ) : (
+         <div className="grid gap-1">
+@@ -179,7 +245,11 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+             const busy = busyId === session.id
+ 
+             return (
+-              <div className="scroll-mt-6 rounded-lg" id={`archived-session-${session.id}`} key={session.id}>
++              <div
++                className="scroll-mt-6 rounded-lg"
++                id={`archived-session-${session.id}`}
++                key={archivedRowKey(session)}
++              >
+                 <ListRow
+                   action={
+                     <div className="flex items-center gap-1.5">
+diff --git a/apps/desktop/src/store/sidebar-archive-progress.test.ts b/apps/desktop/src/store/sidebar-archive-progress.test.ts
+new file mode 100644
+index 00000000..f7b2506e
+--- /dev/null
++++ b/apps/desktop/src/store/sidebar-archive-progress.test.ts
+@@ -0,0 +1,84 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { SessionInfo } from '@/types/hermes'
++
++import { listEveryArchivedSession } from './sidebar-archive'
++
++const listAllProfileSessions = vi.hoisted(() => vi.fn())
++
++vi.mock('@/api/sessions', () => ({ listAllProfileSessions }))
++
++const archivedPage = (offset: number, count = 500): SessionInfo[] =>
++  Array.from(
++    { length: count },
++    (_, i) => ({ id: `archive-${offset + i}`, archived: true, profile: 'default' }) as SessionInfo
++  )
++
++const livePin = { id: 'pinned', archived: false, profile: 'default', pinned: true } as SessionInfo
++
++beforeEach(() => listAllProfileSessions.mockReset())
++
++describe('archived page publication', () => {
++  it('keeps 2500 completed rows when the sixth page times out, preserving offsets and the original error', async () => {
++    const timeout = new Error('Timed out connecting to Hermes backend after 60000ms')
++    let rejectSixth!: (reason?: unknown) => void
++
++    const sixth = new Promise<never>((_, reject) => {
++      rejectSixth = reject
++    })
++
++    listAllProfileSessions.mockImplementation((...args: unknown[]) => {
++      const offset = Number(args[6])
++
++      return offset === 2500 ? sixth : Promise.resolve({ sessions: [...archivedPage(offset), livePin], total: 3000 })
++    })
++
++    const snapshots: SessionInfo[][] = []
++    const done = listEveryArchivedSession({ onPage: rows => snapshots.push(rows) })
++
++    await vi.waitFor(() => expect(listAllProfileSessions).toHaveBeenCalledTimes(6))
++    expect(snapshots).toHaveLength(5)
++    expect(snapshots.map(rows => rows.filter(row => row.archived).length)).toEqual([500, 1000, 1500, 2000, 2500])
++    expect(snapshots[4].filter(row => row.id === 'pinned')).toHaveLength(1)
++    expect(listAllProfileSessions.mock.calls.map(args => args[6])).toEqual([0, 500, 1000, 1500, 2000, 2500])
++
++    const failure = expect(done).rejects.toBe(timeout)
++    rejectSixth(timeout)
++    await failure
++    expect(snapshots[4].filter(row => row.archived)).toHaveLength(2500)
++  })
++
++  it('publishes successful sibling profiles but rejects a partial-profile response', async () => {
++    listAllProfileSessions.mockResolvedValue({
++      sessions: archivedPage(0, 1),
++      total: 1,
++      errors: [{ profile: 'work', error: 'profile read failed' }]
++    })
++    const onPage = vi.fn()
++
++    await expect(listEveryArchivedSession({ onPage })).rejects.toThrow('profile read failed')
++    expect(onPage).toHaveBeenCalledWith(archivedPage(0, 1))
++  })
++
++  it('stops the next page after cancellation during a completed-page callback', async () => {
++    listAllProfileSessions.mockResolvedValue({ sessions: archivedPage(0), total: 1000 })
++    const controller = new AbortController()
++
++    await expect(
++      listEveryArchivedSession({
++        signal: controller.signal,
++        onPage: () => controller.abort()
++      })
++    ).rejects.toMatchObject({ name: 'AbortError' })
++
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
++  })
++
++  it('does not request a page for an already-cancelled scope', async () => {
++    const controller = new AbortController()
++    controller.abort()
++
++    await expect(listEveryArchivedSession({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
++    expect(listAllProfileSessions).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/src/store/sidebar-archive.ts b/apps/desktop/src/store/sidebar-archive.ts
+index ec9d34f0..e3ad3296 100644
+--- a/apps/desktop/src/store/sidebar-archive.ts
++++ b/apps/desktop/src/store/sidebar-archive.ts
+@@ -35,7 +35,12 @@ const ARCHIVED_FETCH_PAGE_SIZE = 500
+  * a page with no new archived row stops it too: a row archived or reordered
+  * mid-load can leave the distinct count short for good.
+  */
+-export async function listEveryArchivedSession(): Promise<SessionInfo[]> {
++export async function listEveryArchivedSession(
++  options: {
++    onPage?: (sessions: SessionInfo[]) => void
++    signal?: AbortSignal
++  } = {}
++): Promise<SessionInfo[]> {
+   const sessions: SessionInfo[] = []
+   const seen = new Set<string>()
+   let archivedCount = 0
+@@ -43,7 +48,11 @@ export async function listEveryArchivedSession(): Promise<SessionInfo[]> {
+   let offset = 0
+ 
+   while (true) {
++    // The REST list API has no AbortSignal input yet. Fence publication and
++    // further requests when a Settings mount or scope is superseded.
++    options.signal?.throwIfAborted()
+     const page = await listAllProfileSessions(ARCHIVED_FETCH_PAGE_SIZE, 0, 'only', 'recent', 'all', {}, offset)
++    options.signal?.throwIfAborted()
+     const archivedBefore = archivedCount
+ 
+     for (const session of page.sessions) {
+@@ -61,6 +70,14 @@ export async function listEveryArchivedSession(): Promise<SessionInfo[]> {
+ 
+     offset += ARCHIVED_FETCH_PAGE_SIZE
+ 
++    // A later timeout must never erase pages already received. Consumers
++    // own the incomplete/error state and cannot mutate this snapshot.
++    options.onPage?.([...sessions])
++
++    if (page.errors?.length) {
++      throw new Error(page.errors[0].error)
++    }
++
+     if (
+       page.sessions.length === 0 ||
+       archivedCount >= page.total ||
