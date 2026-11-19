@@ -5,6 +5,7 @@ context compression AND on a committed proactive tool-result prune, because both
 original content with a one-line marker; entries whose full result survives the rewrite are kept.
 """
 
+import hashlib
 import json
 import os
 import threading
@@ -31,6 +32,12 @@ def _skill_view_fingerprint(payload: dict) -> tuple | None:
         return None
 
 
+def _result_digest(payload: dict) -> bytes:
+    # Same semantic result, regardless of JSON whitespace or key order.
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("ascii")).digest()
+
+
 def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
     """Record a served skill_view so an identical repeat can be deduped."""
     # Never dedup setup-needed views: readiness depends on config/env state that
@@ -43,7 +50,7 @@ def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
     key = (str(payload.get("name") or name), file_path or "")
     with _skill_view_tracker_lock:
         cache = _skill_view_tracker.setdefault(str(task_id), {})
-        cache[key] = fp
+        cache[key] = (fp, _result_digest(payload))
         while len(cache) > _SKILL_VIEW_DEDUP_CAP:  # FIFO eviction
             del cache[next(iter(cache))]
 
@@ -59,7 +66,8 @@ def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
             return None
         # Record key is the RESOLVED name; match raw and resolved forms so
         # 'category/skill' and bare-name views coalesce.
-        for key, (src, mtime_ns, size) in list(cache.items()):
+        for key, (fingerprint, _) in list(cache.items()):
+            src, mtime_ns, size = fingerprint
             rec_name, rec_fp = key
             if rec_fp != (file_path or "") or (
                     rec_name != n and not n.endswith("/" + rec_name)
@@ -80,9 +88,9 @@ def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
     return None
 
 
-def _surviving_skill_view_keys(messages: list) -> set[tuple[str, str]]:
-    """Dedup keys whose full skill_view result is still verbatim in *messages*."""
-    keys: set[tuple[str, str]] = set()
+def _surviving_skill_view_keys(messages: list) -> set[tuple[tuple[str, str], bytes]]:
+    """Match both the page and the result version that survived the rewrite."""
+    keys: set[tuple[tuple[str, str], bytes]] = set()
     for msg in messages:
         content = msg.get("content") if isinstance(msg, dict) else None
         if msg.get("role") != "tool" or not isinstance(content, str) or '"_source_path"' not in content:
@@ -92,7 +100,8 @@ def _surviving_skill_view_keys(messages: list) -> set[tuple[str, str]]:
         except ValueError:
             continue
         if isinstance(payload, dict) and payload.get("success") and payload.get("content") is not None:
-            keys.add((str(payload.get("name") or ""), str(payload.get("file") or "")))
+            key = (str(payload.get("name") or ""), str(payload.get("file") or ""))
+            keys.add((key, _result_digest(payload)))
     return keys
 
 
@@ -106,5 +115,5 @@ def reset_skill_view_dedup(task_id: str | None = None, *, surviving_messages: li
         cache = _skill_view_tracker.pop(str(task_id), None)
         if cache and surviving_messages:
             surviving = _surviving_skill_view_keys(surviving_messages)
-            if kept := {key: fp for key, fp in cache.items() if key in surviving}:
+            if kept := {key: entry for key, entry in cache.items() if (key, entry[1]) in surviving}:
                 _skill_view_tracker[str(task_id)] = kept

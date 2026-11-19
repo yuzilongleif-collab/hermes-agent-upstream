@@ -138,6 +138,17 @@ class TestResetKeepsSurvivingResults:
         reset_skill_view_dedup("t-svd", surviving_messages=self._transcript(body))
         assert _view("demo-dedup-skill").get("dedup") is True
 
+    def test_older_surviving_result_does_not_cover_newer_version(self, skills_home):
+        args = {"name": "demo-dedup-skill"}
+        old = _skill_view_with_bump(args, task_id="t-svd")
+        md = skills_home / "skills" / args["name"] / "SKILL.md"
+        md.write_text(md.read_text(encoding="utf-8") + "\nVersion two.\n", encoding="utf-8")
+        assert "Version two." in _view(args["name"])["content"]
+
+        # The disk and tracker are at v2, but the rewrite kept only v1.
+        reset_skill_view_dedup("t-svd", surviving_messages=self._transcript(old))
+        assert "Version two." in _view(args["name"]).get("content", "")
+
     def test_demoted_result_serves_content_again(self, skills_home):
         _view("demo-dedup-skill")
         marker = "[skill_view] name=demo-dedup-skill (2,000 chars)"
