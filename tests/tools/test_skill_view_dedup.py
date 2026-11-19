@@ -44,6 +44,52 @@ def _view(name, file_path=None, task="t-svd"):
         args["file_path"] = file_path
     return json.loads(_skill_view_with_bump(args, task_id=task))
 
+
+@pytest.mark.parametrize("survivor", ["v1", "v2", "none", "stub", "preview", "checkpoint", "warned", "short_warning"])
+def test_rewrite_requires_exact_reference_and_independent_sibling(skills_home, survivor):
+    """The guide changed twice at the same path. A retained old body is not proof of the new one."""
+    from types import SimpleNamespace
+    from agent.turn_preflight import _proactive_tool_result_prune
+
+    name = "demo-dedup-skill"
+    root = skills_home / "skills" / name
+    guide, sibling = "references/guide.md", "references/other.md"
+    (root / sibling).write_text("Sibling instructions", encoding="utf-8")
+
+    def pair(file, call_id):
+        args = {"name": name, "file_path": file}
+        raw = _skill_view_with_bump(args, task_id="t-svd")
+        return [{"role": "assistant", "tool_calls": [{"id": call_id, "type": "function", "function": {
+            "name": "skill_view", "arguments": json.dumps(args)}}]},
+                {"role": "tool", "name": "skill_view", "tool_call_id": call_id, "content": raw}]
+
+    first = pair(guide, "one")
+    (root / guide).write_text("Updated reference", encoding="utf-8")
+    second, stub, other = pair(guide, "two"), pair(guide, "stub"), pair(sibling, "other")
+    assert "Detailed reference" in first[-1]["content"] and "Updated reference" in second[-1]["content"]
+    assert json.loads(stub[-1]["content"])["dedup"]
+    preview = [second[0], {**second[-1], "content": "<persisted-output>\nPreview: " + second[-1]["content"][:20]}]
+    checkpoint = {"role": "assistant", "codex_reasoning_items": [{"type": "compaction", "encrypted_content": "opaque"}]}
+    from agent.tool_guardrails import ToolGuardrailDecision, append_toolguard_guidance
+    warn = ToolGuardrailDecision(action="warn", code="repeated_exact_success", message="Try another approach.", count=2)
+    def warned(raw):
+        return [second[0], {**second[-1], "content": append_toolguard_guidance(raw, warn)}]
+    kept = {"v1": first, "v2": second, "none": [], "stub": stub, "preview": preview,
+            "warned": warned(second[-1]["content"]), "short_warning": warned(second[-1]["content"][:-1]),
+            "checkpoint": [*second, checkpoint]}[survivor]
+    rewritten = [*kept, *other]
+    compressor = SimpleNamespace(prune_tool_results_only=lambda *a, **kw: (rewritten, 1))
+    agent = SimpleNamespace(session_id="", compression_checkpoint_required=False)
+    assert _proactive_tool_result_prune(agent, compressor, [*first, *second, *other], 100,
+                                        effective_task_id="t-svd") is rewritten
+    result = _view(name, guide)
+    if survivor in {"v2", "warned"}:
+        assert result.get("dedup") is True
+    else:
+        assert result.get("content") == "Updated reference"
+    assert _view(name, sibling).get("dedup") is True
+
+
 class TestSkillViewDedup:
     def test_first_view_returns_full_content(self, skills_home):
         r = _view("demo-dedup-skill")

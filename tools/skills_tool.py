@@ -779,7 +779,7 @@ registry.register(
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count/use on success (best-effort). Repeat-view dedup
     mirrors read_file's unchanged-stub: a result byte-identical to one already served for the
-    same skill file in this session returns a short stub (cache cleared on context compression)."""
+    same skill file in this session returns a short stub (released if a rewrite removes it)."""
     name = args.get("name", "")
     task_id = kw.get("task_id")
     # The background-review fork shares the parent's task_id (prefix-cache parity). A stub there
