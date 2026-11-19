@@ -590,7 +590,11 @@ def salvage_grown_transcript(
     if estimate_messages_tokens_rough(out) >= budget:
         _salvage_reduce_todo_snapshot(out)
     has_user = any(isinstance(message, dict) and message.get("role") == "user" for message in out)
-    return out if has_user and estimate_messages_tokens_rough(out) < budget else None
+    if not has_user or estimate_messages_tokens_rough(out) >= budget:
+        return None
+    from tools.tool_result_storage import pruned_archive_refs
+    # Eliding a generated inventory (or a stub) must not discard its recovery path.
+    return None if pruned_archive_refs(candidate) - pruned_archive_refs(out) else out
 
 
 # Bounded probe: catch the restored head plus a few stacked handoff/ack turns
@@ -1219,6 +1223,8 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     the full shape; a mismatched size class protects blob-heavy rows as "small" and compaction re-fires.
     ``charge_stale_thinking=False`` skips newest-turn-only thinking keys. Accounting only; never mutates."""
     # Charge the wire substitute, not both it and the clean display content.
+    from tools.tool_result_storage import archive_summary_model_row
+    msg = archive_summary_model_row(msg)
     sidecar = msg.get("api_content")
     content = sidecar if isinstance(sidecar, str) and sidecar and msg.get("role") in ("user", "assistant") else msg.get("content") or ""
     text_tokens = estimate_tokens_rough(content) if isinstance(content, str) else _content_length_for_budget(content) // _CHARS_PER_TOKEN
@@ -4104,20 +4110,6 @@ Write only the summary body. Do not include any preamble or prefix."""
         return f"{replacement}{body}".strip()
 
     @classmethod
-    def _find_context_summaries(cls, messages: list[dict[str, Any]], start: int, end: int) -> list[tuple[int, str]]:
-        """Find handoff summaries inside a compression window."""
-        n = len(messages)
-        # Clamp: callers may pass end = len(messages)+1.
-        # Defensive: clamp bounds so a caller passing an out-of-range end (e.g. tail-cut returning
-        # len(messages)+1 when head_end >= n) cannot trigger IndexError. (#75588)
-        start = max(0, min(start, n))
-        end = max(start, min(end, n))
-        return [
-            (idx, cls._strip_summary_prefix(_content_text_for_contains(messages[idx].get("content"))))
-            for idx in range(start, end) if cls._is_context_summary_message(messages[idx])
-        ]
-
-    @classmethod
     def _find_latest_context_summary(
         cls, messages: list[dict[str, Any]], start: int, end: int,
     ) -> tuple[Optional[int], str]:
@@ -5134,13 +5126,17 @@ Write only the summary body. Do not include any preamble or prefix."""
         compressed = self._assemble_with_archive_list(messages, compress_start, compress_end, scan, summary)
         return self._finalize_compressed(compressed, canonical_messages, n_messages, spare_pending_images, pruned_count)
 
-    def _assemble_compressed(
+    def _assemble_with_archive_list(
         self, messages: list[dict[str, Any]], compress_start: int, compress_end: int, scan: _HandoffScan, summary: str,
     ) -> list[dict[str, Any]]:
         """Head + summary + tail from the pruned copy: its tool-result demotions are what let an oversized
         head/tail compress at all (#61932); tool-call arguments are never rewritten by pruning."""
         compressed = self._assemble_head(messages, compress_start)
         tail_messages = self._assemble_tail(messages, compress_end, scan.tail_start, scan.summary_indices)
+        from tools.tool_result_storage import archive_list_for_summary, pruned_archive_refs
+        # A handoff in the protected head/tail may just have been stripped. Only actual
+        # survivors can stand in for a reference in the new summary.
+        summary += archive_list_for_summary(pruned_archive_refs(messages), [*compressed, *tail_messages, {"content": summary}])
         summary, compressed, tail_messages = with_skill_safety_rule(summary, compressed, tail_messages)
         summary_role, merge_into_tail, force_user_leading, first_tail_visible_idx = (
             self._summary_placement(compressed, tail_messages, compress_start)

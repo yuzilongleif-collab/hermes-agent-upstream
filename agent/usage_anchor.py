@@ -54,7 +54,10 @@ def _priced_prefix_fingerprint(messages: list[dict[str, Any]], base_count: int) 
     if base_count <= 0 or len(messages) < base_count:
         return None
     fps = []
+    from tools.tool_result_storage import archive_inventory_fell_back
     for msg in messages[:base_count]:
+        if isinstance(msg, dict) and archive_inventory_fell_back(msg):
+            return None  # price the full fallback, not a provider reading of the now-unavailable index
         fp = message_fingerprint(msg)
         if not fp:
             return None

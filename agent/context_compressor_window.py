@@ -142,18 +142,16 @@ class CompactionWindowMixin:
             plan = self._demote_stale_tail_tools(plan, end)
         return plan, pruned_count
 
-    def _assemble_with_archive_list(
-        self, messages: list[dict[str, Any]], start: int, end: int, scan: Any, summary: str,
-    ) -> list[dict[str, Any]]:
-        """``_assemble_compressed`` with every archive a replaced row named, that neither the kept head and tail
-        nor the generated summary still name, listed in the summary row: the summarizer never saw the pointers
-        (it read the originals), and the list keeps the model's path back and the reference the retention
-        sweep keeps the file for."""
-        from tools.tool_result_storage import archive_list_for_summary, pruned_archive_refs
+    @classmethod
+    def _find_context_summaries(cls, messages: list[dict[str, Any]], start: int, end: int) -> list[tuple[int, str]]:
+        """Find the model-facing handoffs; the assembler still reads the full durable rows."""
+        from session_rules.turns import _content_text_for_contains
+        from tools.tool_result_storage import archive_summary_model_text
 
-        named = pruned_archive_refs(messages)
-        kept = [*messages[:start], *messages[max(end, scan.tail_start):], {"content": summary}]
-        return self._assemble_compressed(messages, start, end, scan, summary + archive_list_for_summary(named, kept))
+        return [
+            (idx, cls._strip_summary_prefix(archive_summary_model_text(_content_text_for_contains(messages[idx].get("content")))))
+            for idx in range(max(0, start), min(end, len(messages))) if cls._is_context_summary_message(messages[idx])
+        ]
 
     def _offload_window_results(
         self, plan: list[dict[str, Any]], start: int, end: int,

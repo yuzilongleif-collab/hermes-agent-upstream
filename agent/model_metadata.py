@@ -2371,11 +2371,11 @@ def estimate_messages_tokens_rough(messages: list[dict[str, Any]], *, charge_sta
     rides the wire only for the NEWEST assistant turn, so excluding it keeps the compaction TRIGGER
     in the same size class as the walk — otherwise reasoning-heavy sessions fire preflight forever."""
     from agent.image_token_cost import current_image_token_cost
-
+    from tools.tool_result_storage import archive_summary_model_row
     image_cost = current_image_token_cost()
     if not charge_stale_thinking:
         messages = _strip_stale_thinking_for_estimate(messages)
-    return sum(_estimate_message_tokens_cached(msg, image_cost) for msg in messages)
+    return sum(_estimate_message_tokens_cached(archive_summary_model_row(msg), image_cost) for msg in messages)
 
 
 def estimate_native_anthropic_messages_tokens_rough(messages: list[dict[str, Any]]) -> int:

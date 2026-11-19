@@ -179,6 +179,8 @@ def assemble_api_request(
     from agent.anthropic_thinking_replay import apply_rejected_thinking_suppression
 
     apply_rejected_thinking_suppression(agent, api_messages)
+    from tools.tool_result_storage import archive_summary_model_row
+    api_messages = [archive_summary_model_row(row) for row in api_messages]
 
     # Runs unconditionally (not gated on context_compressor) so orphaned tool
     # results from session loading or manual message edits are always caught.

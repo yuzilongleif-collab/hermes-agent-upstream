@@ -501,8 +501,91 @@ def archive_list_for_summary(named: set[str], kept: list[dict[str, Any]]) -> str
     if not missing:
         return ""
     home = get_hermes_home()
-    return "\n\n" + ARCHIVE_LIST_HEADING + "".join(
-        f"\n- {_archive_stub_path(str(home / ref))}" for ref in sorted(missing))
+    paths = [_archive_stub_path(str(home / ref)) for ref in sorted(missing)]
+    inventory = "\n".join(paths)
+    index_line = ""
+    if len(inventory) > DEFAULT_PREVIEW_SIZE_CHARS and _backend_reads_host_files():
+        index = _archive_inventory_index(inventory, create=True)
+        if index:
+            index_line = "\n" + _INDEX_HINT + index
+    return "\n\n" + ARCHIVE_LIST_HEADING + index_line + "\n- " + "\n- ".join(paths)
+
+
+_INDEX_HINT = "Path index if available (read_file with offset/limit): "
+_INDEX_HEADER = "\n\n" + ARCHIVE_LIST_HEADING + "\n" + _INDEX_HINT
+
+
+def _archive_inventory_index(inventory: str, *, create: bool) -> str | None:
+    """A verified, disposable copy. The transcript retains both its reference and every original."""
+    import stat
+    from agent.file_safety import get_read_block_error
+
+    try:
+        data = (inventory + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    name = "archive-list-" + hashlib.sha256(data).hexdigest() + ".txt"
+    path = get_spillover_dir() / name
+    if get_read_block_error(str(path)):
+        return None
+    try:
+        if create and not path.exists():
+            _write_to_spillover(inventory + "\n", name, exclusive=True)
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size != len(data):
+            return None
+        with path.open("rb") as source:
+            if source.read(len(data) + 1) != data:
+                return None
+    except OSError:
+        return None
+    return _archive_stub_path(str(path))
+
+
+def archive_summary_model_text(text: Any) -> Any:
+    """Replace only the producer's verified appendix, never the live text adjoining a handoff."""
+    if not isinstance(text, str) or _INDEX_HEADER not in text:
+        return text
+    from session_rules.turns import (_MERGED_PRIOR_CONTEXT_HEADER, _MERGED_SUMMARY_DELIMITER,
+                                     _SUMMARY_END_MARKER, _starts_with_summary_prefix)
+    from agent.context_compressor_tail import _SKILL_SAFETY_SUFFIX
+
+    start = 0
+    if text.startswith(_MERGED_PRIOR_CONTEXT_HEADER):
+        delimiter = "\n\n" + _MERGED_SUMMARY_DELIMITER + "\n\n"
+        if text.count(delimiter) != 1:
+            return text
+        start = text.index(delimiter) + len(delimiter)
+    if not _starts_with_summary_prefix(text[start:]):
+        return text
+    end = text.find("\n\n" + _SUMMARY_END_MARKER, start)
+    if end < 0 or not _backend_reads_host_files():
+        return text
+    if text.endswith(_SKILL_SAFETY_SUFFIX, start, end):
+        end -= len(_SKILL_SAFETY_SUFFIX)
+    at = text.rfind(_INDEX_HEADER, start, end)
+    if at < 0:
+        return text
+    index, sep, bullets = text[at + len(_INDEX_HEADER):end].partition("\n- ")
+    if not sep or _archive_inventory_index(bullets.replace("\n- ", "\n"), create=False) != index:
+        return text
+    return text[:at] + "\n\n" + _INDEX_HINT + index + text[end:]
+
+
+def archive_summary_model_row(row: Any) -> Any:
+    """Copy only a carrier whose wire content differs; estimates must see the same bytes as sends."""
+    if not isinstance(row, dict) or row.get("role") not in ("user", "assistant"):
+        return row
+    key = "api_content" if isinstance(row.get("api_content"), str) and row["api_content"] else "content"
+    original = row.get(key)
+    projected = archive_summary_model_text(original)
+    return row if projected is original else {**row, key: projected}
+
+
+def archive_inventory_fell_back(row: dict) -> bool:
+    """A previous provider count may have priced just the pointer rather than this full list."""
+    text = row.get("api_content") or row.get("content")
+    return isinstance(text, str) and _INDEX_HEADER in text and archive_summary_model_row(row) is row
 
 
 def discard_archives(paths: list[str]) -> None:

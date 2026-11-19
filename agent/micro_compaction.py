@@ -50,14 +50,18 @@ class MicroCompactionMixin:
         if last >= head_end:
             # Resumed session: rehydrate the rolling summary from the surviving marker so the next
             # pass merges, not replaces.
+            from tools.tool_result_storage import ARCHIVE_LIST_HEADING, archive_summary_model_text
+            content = messages[last].get("content")
             recovered = "" if self._micro_compact_rolling_summary.strip() else (
-                self._rolling_summary_from_marker(messages[last].get("content"))
+                self._rolling_summary_from_marker(archive_summary_model_text(content))
             )
             if recovered:
                 self._micro_compact_rolling_summary = recovered
                 # Rehydration proves containment: this marker (batch or micro) becomes
                 # supersede/defrag-eligible; unabsorbed markers never get the key.
-                messages[last][_cc().MICRO_COMPACT_MARKER_KEY] = True
+                # A semantic summary cannot replace the canonical archive inventory.
+                if ARCHIVE_LIST_HEADING not in str(content):
+                    messages[last][_cc().MICRO_COMPACT_MARKER_KEY] = True
                 logger.info("Micro-compaction: recovered rolling summary from transcript (%d chars)", len(recovered))
         self._micro_compact_cursor = cursor
         return cursor

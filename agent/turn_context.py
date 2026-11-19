@@ -143,7 +143,14 @@ def substitute_api_content(api_msg: dict[str, Any]) -> Optional[str]:
     sidecar = api_msg.pop("api_content", None)
     if isinstance(sidecar, str) and sidecar and api_msg.get("role") in ("user", "assistant"):
         api_msg["content"] = sidecar
+    project_archive_summary_for_send(api_msg)
     return sidecar
+
+
+def project_archive_summary_for_send(msg: dict[str, Any]) -> None:
+    from tools.tool_result_storage import archive_summary_model_text
+    if msg.get("role") in ("user", "assistant") and "content" in msg:
+        msg["content"] = archive_summary_model_text(msg["content"])
 
 
 def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
@@ -1515,6 +1522,8 @@ def build_api_messages(
             # prefix stays byte-stable. User rows carry the injection sidecar; user
             # and assistant rows may carry a sanitize-divergence sidecar.
             api_msg["content"] = _api_content
+
+        project_archive_summary_for_send(api_msg)
 
         # Replay stored reasoning on every carrier the active route reads (and strip the
         # rest): message_sanitization.reasoning_replay_route owns the decision.
